@@ -207,7 +207,7 @@ def selftest_flows():
              notify=lambda t, m: fake["calls"].append(("notify", t)), diagnose=lambda ds: "diag",
              http=lambda *a, **k: {"body": ""})
     datetime.datetime, time.sleep = FakeDT, lambda s: None
-    def installs(): return sum(1 for c in fake["calls"] if c[0] == "/core/update" and "version" not in (c[1] or {}))
+    def installs(): return sum(1 for c in fake["calls"] if c[0] == "/core/update" and (c[1] or {}).get("backup"))
     try:
         # audit #1: Supervisor reverts a failed start -> must skip + notify, never reinstall the same version
         preflight()                                            # 04:00, in window -> install
@@ -256,6 +256,7 @@ def selftest_flows():
         fake["now"] = datetime.datetime(2026, 2, 2, 3, 30)
         preflight()
         assert installs() == 1, fake["calls"]
+        assert ("/core/update", {"version": "1.1", "backup": True}) in fake["calls"]   # pinned to the assessed version
         # v1.1 (b): a blocked version is never installed, even in the window (state list and config key)
         fresh(datetime.datetime(2026, 2, 3, 4, 0))
         save({"blocked": ["1.1"]})
@@ -289,6 +290,13 @@ def selftest_flows():
         save({"last_good": "1.0", "pre": {"version": "1.0", "failing": {}, "at": (fake["now"] - datetime.timedelta(minutes=20)).isoformat()}})
         check()
         assert "1.1" in load()["blocked"]
+        # v1.1 upgrade: a 1.0 state (no `blocked`) whose release was skipped in HA never installs it after the upgrade
+        fresh(datetime.datetime(2026, 2, 7, 4, 0), skipped="1.1")
+        save({"last_good": "1.0", "bad_version": "0.9"})
+        preflight()
+        preflight()
+        assert installs() == 0 and load()["blocked"] == ["0.9", "1.1"], fake["calls"]
+        assert [c for c in fake["calls"] if c[0] == "notify"] == [("notify", "Smart updater upgraded to 1.1")]
     finally:
         datetime.datetime, time.sleep = real_dt, real_sleep
         g.update(saved)
@@ -352,9 +360,27 @@ def gh_issues(q, n=5, closed=None):
 
 def load():
     try:
-        return json.load(open(STATE))
+        s = json.load(open(STATE))
     except FileNotFoundError:
-        return {}
+        s = {}
+    if "blocked" not in s:
+        migrate_blocked(s)
+    return s
+
+def migrate_blocked(s):
+    """Once, on the first run of 1.1+: 1.0 kept "never install this" only as HA's skip, which 1.1 ignores. Seed `blocked`
+    from what 1.0 left behind, and from HA's skipped_version (conservative: a human may have made that skip)."""
+    try:
+        skipped = ha(f"/states/{CORE_UPDATE}")["attributes"].get("skipped_version")
+    except Exception as e:
+        return log(f"blocked migration deferred: {e!r}")     # not written, so it is retried on the next run
+    found = [(s.get("open_issue") or {}).get("version"), s.get("bad_version"), skipped]
+    s["blocked"] = list(dict.fromkeys(v for v in found if v))
+    save(s)
+    log(f"MIGRATED blocked={s['blocked']}")
+    if s["blocked"]:
+        notify("Smart updater upgraded to 1.1", f"Kept {', '.join(s['blocked'])} blocked (skipped or failed before). "
+               "Remove it from blocked in state.json to allow it.")
 
 def save(s):
     tmp = STATE + ".tmp"
@@ -442,15 +468,14 @@ def rollback(target):
             time.sleep(60)
     notify("HA rollback FAILED", f"Could not roll back to {target}. Do it by hand: ha core update --version {target}")
 
-def install(s, v_now):
+def install(s, v_now, latest):
     s["pre"] = {"version": v_now, "failing": failing(entries()), "at": datetime.datetime.now().isoformat()}
     s.setdefault("last_good", v_now)
     save(s)
     log(f"installing core update from {v_now}")
     try:
-        sup("/core/update", "POST", {"backup": True}, timeout=1800)
+        sup("/core/update", "POST", {"version": latest, "backup": True}, timeout=1800)   # pinned: never a newer, unassessed one
     except urllib.error.HTTPError as e:      # a real refusal; our own process dying in the restart never gets here
-        latest = ha(f"/states/{CORE_UPDATE}")["attributes"].get("latest_version")
         n = s.get("refusals", {}).get(latest, 0) + 1
         s["refusals"] = {latest: n}
         s.pop("pre", None)
@@ -487,7 +512,7 @@ def preflight():
     if d in ("wait", "hold") and badge:
         clear_badge()                             # hides HA's badge only; preflight still installs it later
     if d == "install":
-        install(s, v_now)
+        install(s, v_now, latest)
 
 def dryrun(latest):
     """preflight's AI assessment for any version, without installing or touching state."""

@@ -11,15 +11,25 @@
   Home Assistant's own skip no longer stops the updater (1.0.0 relied on it); skipping a Core release in the UI now only
   hides the badge.
 - The package's preflight automation no longer requires the update entity to be `on`. It runs hourly and whenever
-  `latest_version` changes. **Upgrading: copy the new `packages/smart_updater.yaml` too**, then reload automations.
+  `latest_version` changes (see Upgrading below).
 - Preflight prompt: closed issues are resolved and never count as risk; a fix listed in the release notes counts
   against risk; only open issues reported against the new version for an integration in use count. Release-note lines
   that mention the open problem's integration (from the full notes, not the truncated copy) are quoted as evidence
   for `FIXED: yes`. The closed-issue citation gate is unchanged. (A live run on 2026.10.4 had said `RISK: high` by
   citing the closed issue its own release notes fixed.)
 - `dryrun` reports `blocked` for a blocked version.
+- Installs are pinned: the Supervisor is asked for exactly the version the preflight assessed, so a newer release
+  that appears in between is never installed unassessed.
 - `selftest`: new flows for a skipped release installing in the window, blocked versions, a failed install that is
   never retried, a hold that notifies once, and a rolled-back version being blocked.
+
+### Upgrading from 1.0.0
+
+- Copy the new `smart_updater/smart_updater.py` and `packages/smart_updater.yaml`, then reload automations.
+- On its first run, 1.1 seeds its `blocked` list once from what 1.0 left behind: the version of an open problem
+  (a failed install or rollback), a recorded bad version, and the release currently skipped in Home Assistant. A
+  skip is treated as a block because a person may have made it. The log shows `MIGRATED blocked=[...]` and, if
+  anything was kept, you get one notification. To allow such a release, remove it from `blocked` in `state.json`.
 
 ## 1.0.0 (2026-10-25)
 
