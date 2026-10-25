@@ -1,0 +1,7 @@
+# What the script writes next to itself on a Home Assistant box. Never commit these.
+.token
+config.json
+state.json
+state.json.tmp
+log.txt
+__pycache__/

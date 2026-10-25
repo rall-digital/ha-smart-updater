@@ -1,0 +1,8 @@
+{
+  "notify": "notify.mobile_app_your_phone",
+  "ai_entity": "ai_task.openai_ai_task",
+  "core_update": "update.home_assistant_core_update",
+  "window": [3, 5],
+  "stuck_min": 30,
+  "ha_url": "http://localhost:8123"
+}

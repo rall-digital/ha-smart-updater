@@ -1,0 +1,31 @@
+# Keep auto-installing everything else, but leave Home Assistant Core to the smart updater.
+# This is the "install every update right away" automation from hass-auto-update with one change:
+# both templates drop update.home_assistant_core_update (rejectattr). If you already run that automation, add the
+# rejectattr line to both of its templates instead of adding this one; two installers for Core will fight.
+- id: auto_install_update_on_available
+  alias: Auto Install Updates (except Core)
+  description: >-
+    Install any update.* entity except Home Assistant Core as soon as it is available, with an hourly resweep.
+    Core is handled by the smart updater (preflight, health check, rollback).
+  triggers:
+    - trigger: template
+      value_template: >-
+        {{ states.update | selectattr('state', 'eq', 'on')
+           | rejectattr('entity_id', 'eq', 'update.home_assistant_core_update')
+           | map(attribute='entity_id') | sort | join(',') }}
+    - trigger: time_pattern
+      hours: /1
+  actions:
+    - repeat:
+        for_each: >-
+          {{ states.update | selectattr('state', 'eq', 'on')
+             | rejectattr('entity_id', 'eq', 'update.home_assistant_core_update')
+             | map(attribute='entity_id') | list }}
+        sequence:
+          - action: update.install
+            continue_on_error: true
+            target:
+              entity_id: "{{ repeat.item }}"
+          - delay: "00:00:30"
+  mode: queued
+  max: 10

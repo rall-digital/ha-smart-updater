@@ -1,0 +1,51 @@
+# Smart updater for HA Core: AI preflight, health-checked install, auto-rollback, AI diagnosis.
+# Logic lives in /config/smart_updater/smart_updater.py; config.json, .token, state.json and log.txt sit next to it.
+# If you set "core_update" in config.json, change update.home_assistant_core_update below to match.
+# https://github.com/rall-digital/ha-smart-updater  (MIT, RALL DIGITAL LLC)
+shell_command:
+  smart_updater: "python3 /config/smart_updater/smart_updater.py {{ cmd }}"
+
+automation:
+  - id: smart_updater_preflight
+    alias: Smart Updater - Core preflight
+    description: Core update pending -> AI preflight decides hold / install now / wait for the install window.
+    triggers:
+      - trigger: state
+        entity_id: update.home_assistant_core_update
+        to: "on"
+      - trigger: time_pattern
+        minutes: 7
+    conditions:
+      - condition: state
+        entity_id: update.home_assistant_core_update
+        state: "on"
+    actions:
+      - action: shell_command.smart_updater
+        data:
+          cmd: preflight
+    mode: single
+
+  - id: smart_updater_check
+    alias: Smart Updater - Post-start health check
+    description: 10 min after every HA start, compare integrations to the pre-update snapshot; roll back on new failures.
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:10:00"
+      - action: shell_command.smart_updater
+        data:
+          cmd: check
+    mode: single
+
+  - id: smart_updater_sweep
+    alias: Smart Updater - Broken integration sweep
+    description: Every 30 min; any integration failing stuck_min+ min that hasn't been diagnosed gets an AI diagnosis.
+    triggers:
+      - trigger: time_pattern
+        minutes: /30
+    actions:
+      - action: shell_command.smart_updater
+        data:
+          cmd: sweep
+    mode: single
