@@ -8,17 +8,15 @@ shell_command:
 automation:
   - id: smart_updater_preflight
     alias: Smart Updater - Core preflight
-    description: Core update pending -> AI preflight decides hold / install now / wait for the install window.
+    description: >-
+      Hourly, and whenever a new Core release appears: AI preflight decides hold / install now / wait for the install
+      window. No state condition: the updater skips releases itself to hide the badge, so "off" can still be pending.
     triggers:
       - trigger: state
         entity_id: update.home_assistant_core_update
-        to: "on"
+        attribute: latest_version
       - trigger: time_pattern
         minutes: 7
-    conditions:
-      - condition: state
-        entity_id: update.home_assistant_core_update
-        state: "on"
     actions:
       - action: shell_command.smart_updater
         data:

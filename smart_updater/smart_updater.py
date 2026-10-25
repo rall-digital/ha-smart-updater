@@ -2,7 +2,7 @@
 """Smart updater for Home Assistant Core. Runs inside HA core via shell_command.
 
   preflight  core update pending: AI reads release notes + GitHub issues; hold, install now, or wait for the window
-  check      on HA start: diff failing integrations vs pre-update snapshot; new failure -> roll back + skip + AI diagnosis
+  check      on HA start: diff failing integrations vs pre-update snapshot; new failure -> roll back + block + AI diagnosis
   sweep      every 30 min: any integration failing 30+ min that we haven't diagnosed -> AI diagnosis
   selftest   assert-based checks of the pure logic (no network)
 
@@ -21,10 +21,11 @@ DEFAULTS = {"ai_entity": "ai_task.openai_ai_task",            # any ai_task enti
             "core_update": "update.home_assistant_core_update",
             "window": [3, 5],                                  # install core updates between 03:00 and 05:00 local
             "stuck_min": 30,                                   # sweep: diagnose an integration after it has failed this long
-            "ha_url": "http://localhost:8123"}                 # HA's own API, as seen from inside the core container
+            "ha_url": "http://localhost:8123",                 # HA's own API, as seen from inside the core container
+            "blocked_versions": []}                            # versions a human never wants installed, e.g. ["2026.10.3"]
 
 def load_config(path):
-    """(AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, problems). Never raises: a bad file falls back to the
+    """(AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, BLOCKED_VERSIONS, problems). Never raises: a bad file falls back to the
     defaults, so check() can still roll back; the problems are logged on every run."""
     problems = []
     try:
@@ -51,9 +52,13 @@ def load_config(path):
     if not ha_url.startswith(("http://", "https://")):
         problems.append(f"config.json: bad ha_url {c['ha_url']!r}; using {DEFAULTS['ha_url']}")
         ha_url = DEFAULTS["ha_url"]
-    return c["ai_entity"], notify, c["core_update"], window, stuck, ha_url, problems
+    blocked = c["blocked_versions"]
+    if not (isinstance(blocked, list) and all(isinstance(v, str) for v in blocked)):
+        problems.append(f"config.json: blocked_versions must be a list of version strings, got {blocked!r}; ignored")
+        blocked = []
+    return c["ai_entity"], notify, c["core_update"], window, stuck, ha_url, tuple(blocked), problems
 
-AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, CONFIG_PROBLEMS = load_config(os.path.join(DIR, "config.json"))
+AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, BLOCKED_VERSIONS, CONFIG_PROBLEMS = load_config(os.path.join(DIR, "config.json"))
 FAILING = ("setup_error", "setup_retry", "migration_error")
 STALE_MIN = 120          # a pre-update snapshot older than this means check() never ran for that install
 SETTLE_MIN = 15          # pre younger than this at check() time: the install hasn't been applied yet
@@ -96,6 +101,11 @@ def parse_ai(text, closed_urls=()):
         r["fixed"] = "unknown"
     return r
 
+def fix_lines(notes, domains, top=10):
+    """Release-note lines that mention one of the domains (or its first word, or its pip-style name)."""
+    keys = {k for d in domains for k in (d.lower(), d.lower().replace("_", "-"), d.split("_")[0].lower()) if len(k) >= 3}
+    return [l.strip() for l in (notes or "").splitlines() if any(k in l.lower() for k in keys)][:top]
+
 def decide(ai, open_issue, hour):
     if open_issue and ai["fixed"] == "yes":
         return "install"
@@ -133,6 +143,9 @@ def selftest():
     assert decide({"risk": "high", "fixed": None}, None, 4) == "hold"
     assert decide({"risk": None, "fixed": None}, None, 4) == "install"            # AI failed -> window + canary
     assert decide({"risk": "low", "fixed": "no"}, {"x": 1}, 14) == "wait"
+    notes = "## Fixes\n- Bump pylutron-caseta to 0.30.0 (#188388)\n- Fix hue scenes (#1)\n"
+    assert fix_lines(notes, ["lutron_caseta"]) == ["- Bump pylutron-caseta to 0.30.0 (#188388)"]
+    assert fix_lines(notes, []) == [] and fix_lines("", ["hue"]) == []
     selftest_config()
     selftest_flows()
     print("selftest ok")
@@ -147,11 +160,14 @@ def selftest_config():
         return load_config(p)
     *vals, probs = load_config(os.path.join(d, "missing.json"))
     assert vals == ["ai_task.openai_ai_task", None, "update.home_assistant_core_update", (3, 5), 30,
-                    "http://localhost:8123"], vals
+                    "http://localhost:8123", ()], vals
     assert len(probs) == 1 and "notify" in probs[0]                                  # missing NOTIFY is loud
     *vals, probs = cfg('{"notify": "notify.mobile_app_x", "ai_entity": "ai_task.y", "window": [1, 2], "stuck_min": 5}')
     assert vals == ["ai_task.y", "notify/mobile_app_x", "update.home_assistant_core_update", (1, 2), 5,
-                    "http://localhost:8123"] and probs == []
+                    "http://localhost:8123", ()] and probs == []
+    assert cfg('{"notify": "notify.a", "blocked_versions": ["2026.1.1"]}')[6] == ("2026.1.1",)
+    *vals, probs = cfg('{"notify": "notify.a", "blocked_versions": "2026.1.1"}')
+    assert vals[6] == () and any("blocked_versions" in p for p in probs)
     assert cfg('{"notify": "notify.a", "ha_url": "https://localhost:8123/"}')[5] == "https://localhost:8123"
     *vals, probs = cfg('{"notify": "notify.a", "ha_url": "localhost:8123"}')
     assert vals[5] == "http://localhost:8123" and any("bad ha_url" in p for p in probs)
@@ -166,8 +182,10 @@ def selftest_flows():
     """check()/preflight()/sweep() against a fake HA, in a temp state dir."""
     import tempfile
     g = globals()
-    saved = {k: g[k] for k in ("STATE", "LOG", "version", "entries", "ha", "service", "sup", "notify", "diagnose", "gh_issues", "ai", "http")}
-    fake = {"v": "1.0", "entries": [], "calls": [], "latest": "1.1", "now": datetime.datetime(2026, 1, 1, 4, 0)}
+    saved = {k: g[k] for k in ("STATE", "LOG", "version", "entries", "ha", "service", "sup", "notify", "diagnose", "gh_issues", "ai", "http",
+                               "BLOCKED_VERSIONS")}
+    fake = {"v": "1.0", "entries": [], "calls": [], "latest": "1.1", "now": datetime.datetime(2026, 1, 1, 4, 0),
+            "skipped": None, "ai": "RISK: low"}
     class FakeDT(datetime.datetime):
         @classmethod
         def now(cls, tz=None): return fake["now"]
@@ -175,11 +193,17 @@ def selftest_flows():
     d = tempfile.mkdtemp()
     def fsup(path, method="GET", body=None, **kw):
         fake["calls"].append((path, body))
-    def fha(path, *a, **kw):
-        return {"state": "on" if fake["latest"] != fake["v"] else "off", "attributes": {"latest_version": fake["latest"]}}
+    def fha(path, *a, **kw):                    # like HA: a skipped release turns the entity off but keeps latest_version
+        on = fake["latest"] != fake["v"] and fake["skipped"] != fake["latest"]
+        return {"state": "on" if on else "off", "attributes": {"latest_version": fake["latest"], "installed_version": fake["v"],
+                                                               "skipped_version": fake["skipped"]}}
+    def fservice(ds, data, **kw):
+        fake["calls"].append((ds, data))
+        if ds == "update/skip":
+            fake["skipped"] = fake["latest"]
     g.update(STATE=os.path.join(d, "s.json"), LOG=os.path.join(d, "log"), version=lambda: fake["v"],
-             entries=lambda: fake["entries"], ha=fha, sup=fsup, gh_issues=lambda *a, **k: [], ai=lambda *a: "RISK: low",
-             service=lambda ds, data, **kw: fake["calls"].append((ds, data)),
+             entries=lambda: fake["entries"], ha=fha, sup=fsup, gh_issues=lambda *a, **k: [], ai=lambda *a: fake["ai"],
+             service=fservice, BLOCKED_VERSIONS=(),
              notify=lambda t, m: fake["calls"].append(("notify", t)), diagnose=lambda ds: "diag",
              http=lambda *a, **k: {"body": ""})
     datetime.datetime, time.sleep = FakeDT, lambda s: None
@@ -221,6 +245,50 @@ def selftest_flows():
         check()
         assert ("/core/update", {"version": "1.2", "backup": False}) in fake["calls"], fake["calls"]
         assert ("notify", "HA rolled back to 1.3") not in fake["calls"]
+        skip = ("update/skip", {"entity_id": CORE_UPDATE})
+        def fresh(at, **kw):
+            fake.update({"calls": [], "v": "1.0", "latest": "1.1", "skipped": None, "entries": [], "ai": "RISK: low", "now": at, **kw})
+            save({})
+        # v1.1 (a): waiting outside the window skips (badge gone), and still installs at 03:xx though HA shows it skipped
+        fresh(datetime.datetime(2026, 2, 1, 14, 0))
+        preflight()
+        assert installs() == 0 and skip in fake["calls"] and fha("")["state"] == "off"
+        fake["now"] = datetime.datetime(2026, 2, 2, 3, 30)
+        preflight()
+        assert installs() == 1, fake["calls"]
+        # v1.1 (b): a blocked version is never installed, even in the window (state list and config key)
+        fresh(datetime.datetime(2026, 2, 3, 4, 0))
+        save({"blocked": ["1.1"]})
+        preflight()
+        assert installs() == 0 and skip in fake["calls"]
+        fresh(datetime.datetime(2026, 2, 3, 4, 0))
+        g["BLOCKED_VERSIONS"] = ("1.1",)
+        preflight()
+        assert installs() == 0
+        g["BLOCKED_VERSIONS"] = ()
+        # v1.1 (c): a failed install (Supervisor revert) is blocked and never reinstalled, though HA still offers it
+        fresh(datetime.datetime(2026, 2, 4, 4, 0))
+        preflight()
+        fake["now"] += datetime.timedelta(minutes=25)
+        check()                                                # back on 1.0
+        assert installs() == 1 and "1.1" in load()["blocked"]
+        fake.update(skipped=None)                              # even if a human un-skips it in HA
+        fake["now"] += datetime.timedelta(minutes=30)
+        preflight()
+        assert installs() == 1, "reinstalled a failed version"
+        # v1.1 (d): a hold skips and notifies once
+        fresh(datetime.datetime(2026, 2, 5, 4, 0), ai="RISK: high")
+        preflight()
+        fake.update(skipped=None)
+        fake["now"] += datetime.timedelta(hours=1)
+        preflight()
+        assert installs() == 0 and fake["calls"].count(skip) == 2
+        assert fake["calls"].count(("notify", "HA 1.1 held")) == 1, fake["calls"]
+        # v1.1: a rolled-back bad version is blocked
+        fresh(datetime.datetime(2026, 2, 6, 4, 0), v="1.1", entries=[{"entry_id": "x", "domain": "hue", "state": "setup_retry"}])
+        save({"last_good": "1.0", "pre": {"version": "1.0", "failing": {}, "at": (fake["now"] - datetime.timedelta(minutes=20)).isoformat()}})
+        check()
+        assert "1.1" in load()["blocked"]
     finally:
         datetime.datetime, time.sleep = real_dt, real_sleep
         g.update(saved)
@@ -331,16 +399,28 @@ def age_min(pre):
     return (datetime.datetime.now() - datetime.datetime.fromisoformat(pre["at"])).total_seconds() / 60
 
 def failed_install(s, why):
-    """The release never took (request refused, or the Supervisor reverted a failed start): skip it so we don't loop."""
+    """The release never took (request refused, or the Supervisor reverted a failed start): block it so we don't loop."""
     latest = ha(f"/states/{CORE_UPDATE}")["attributes"].get("latest_version")
     s.pop("pre", None)
     s["open_issue"] = {"version": latest, "domains": [], "diagnosis": why, "at": datetime.datetime.now().isoformat()}
+    block(s, latest)
     save(s)
+    clear_badge()
+    notify(f"HA {latest} did not install", f"{why} It is blocked; the next release will be tried automatically.")
+
+def is_blocked(s, v):
+    return v in s.get("blocked", []) or v in BLOCKED_VERSIONS
+
+def block(s, v):
+    """Our own never-install list. HA's skipped_version can't be it: we skip releases just to hide the badge."""
+    if v and v not in s.setdefault("blocked", []):
+        s["blocked"].append(v)
+
+def clear_badge():
     try:
         service("update/skip", {"entity_id": CORE_UPDATE})
     except Exception as e:
         log(f"skip failed: {e!r}")
-    notify(f"HA {latest} did not install", f"{why} It was skipped; the next release will be tried automatically.")
 
 def expire_stale_pre(s, v):
     """check() never ran for an install. Same version -> it never took; new version -> unchecked, just forget it."""
@@ -383,9 +463,14 @@ def install(s, v_now):
 def preflight():
     s = load()
     st = ha(f"/states/{CORE_UPDATE}")
-    if st["state"] != "on":
+    latest, v_now = st["attributes"].get("latest_version"), version()
+    if not latest or latest == (st["attributes"].get("installed_version") or v_now):   # skipped still counts as pending
         return log("preflight: no core update pending")
-    latest, v_now = st["attributes"]["latest_version"], version()
+    badge = st["state"] == "on"
+    if is_blocked(s, latest):
+        if badge:
+            clear_badge()
+        return log(f"preflight {latest}: blocked, not installing")
     expire_stale_pre(s, v_now)
     if s.get("pre"):
         return log("preflight: install already in progress")
@@ -399,6 +484,8 @@ def preflight():
         cache["notified"] = True
         save(s)
         notify(f"HA {latest} held", f"Not installing yet - the AI found risk for this house:\n{cache['text'][:1200]}")
+    if d in ("wait", "hold") and badge:
+        clear_badge()                             # hides HA's badge only; preflight still installs it later
     if d == "install":
         install(s, v_now)
 
@@ -406,14 +493,16 @@ def dryrun(latest):
     """preflight's AI assessment for any version, without installing or touching state."""
     s = load()
     c = assess(s, version(), latest, {})
-    log(f"DRYRUN {latest}: {c['ai']} -> {decide(c['ai'], s.get('open_issue'), datetime.datetime.now().hour)}\n{c['text']}")
+    d = "blocked" if is_blocked(s, latest) else decide(c["ai"], s.get("open_issue"), datetime.datetime.now().hour)
+    log(f"DRYRUN {latest}: {c['ai']} -> {d}\n{c['text']}")
 
 def assess(s, v_now, latest, cache):
     try:
-        notes = http(f"https://api.github.com/repos/home-assistant/core/releases/tags/{latest}",
-                     headers={"User-Agent": "ha-smart-updater"}).get("body", "")[:8000]
+        body = http(f"https://api.github.com/repos/home-assistant/core/releases/tags/{latest}",
+                    headers={"User-Agent": "ha-smart-updater"}).get("body", "") or ""
+        notes = body[:8000]
     except Exception:
-        notes = "(release notes unavailable)"
+        body, notes = "", "(release notes unavailable)"
     domains = sorted({e["domain"] for e in entries() if e["state"] == "loaded"})
     closed = set()
     issues = gh_issues(f'repo:home-assistant/core is:issue "{latest}"', 15)
@@ -421,13 +510,22 @@ def assess(s, v_now, latest, cache):
     for d in (oi or {}).get("domains", []):
         since = (oi.get("at") or "")[:10]         # only issues closed after we hit the problem count as a fix
         issues += gh_issues(f"repo:home-assistant/core is:issue is:closed {d}" + (f" closed:>={since}" if since else ""), 5, closed)
+    fixes = fix_lines(body, (oi or {}).get("domains", []))
     prompt = f"""Home Assistant Core update {v_now} -> {latest} is pending. Decide if it is safe for THIS house.
 Integrations in use: {', '.join(domains)}
 Release notes (truncated):
 {notes}
-Recent GitHub issues mentioning {latest}:
+Recent GitHub issues mentioning {latest} ([open] = unresolved, [closed] = resolved):
 {chr(10).join(issues) or '(none)'}
 {'Open problem we rolled back from: ' + json.dumps(oi) if oi else ''}
+{'Release-note lines (full notes) that mention that problem' + chr(39) + 's integrations:' + chr(10) + chr(10).join(fixes) if fixes else ''}
+
+Rules:
+- Only an [open] issue reported against {latest} itself, for an integration in use, is evidence of risk.
+- A [closed] issue is resolved. It is never risk for {latest}, even if it mentions {latest} or an integration in use.
+- A fix listed in the release notes counts AGAINST risk, never for it.
+- A release-note line that fixes the open problem's integration is evidence for FIXED: yes; also cite the [closed]
+  issue URL above that it resolves.
 
 Reply with exactly these first two lines, then up to 5 short lines of explanation citing issue URLs from above:
 RISK: high or low   (high only if there is credible evidence {latest} breaks an integration in use)
@@ -460,10 +558,12 @@ def check():
         for k in ("bad_version", "pre", "rollback_retried", "rollback_failed_notified"):
             s.pop(k, None)
         save(s)
+        block(s, bad)
+        save(s)
         st = ha(f"/states/{CORE_UPDATE}")
-        if st["attributes"].get("latest_version") == bad:
-            service("update/skip", {"entity_id": CORE_UPDATE})
-        return notify(f"HA rolled back to {v}", f"{bad} broke something, so it was undone and skipped. "
+        if st["attributes"].get("latest_version") == bad and st["state"] == "on":
+            clear_badge()
+        return notify(f"HA rolled back to {v}", f"{bad} broke something, so it was undone and blocked. "
                       f"The next release will be tried automatically.\n\n{s.get('open_issue', {}).get('diagnosis', '')}")
     expire_stale_pre(s, v)
     pre = s.get("pre")
@@ -484,6 +584,7 @@ def check():
     if new:
         domains = sorted(set(new.values()))
         s["bad_version"] = v
+        block(s, v)
         s["open_issue"] = {"version": v, "domains": domains, "diagnosis": "(diagnosing)", "at": datetime.datetime.now().isoformat()}
         save(s)                                   # persist before anything slow or restart-y
         log(f"check: {v} broke {domains}; rolling back to {pre['version']}")

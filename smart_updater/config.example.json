@@ -4,5 +4,6 @@
   "core_update": "update.home_assistant_core_update",
   "window": [3, 5],
   "stuck_min": 30,
-  "ha_url": "http://localhost:8123"
+  "ha_url": "http://localhost:8123",
+  "blocked_versions": []
 }

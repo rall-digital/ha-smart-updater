@@ -130,7 +130,7 @@ grep -n -B3 -A25 'update.install' /config/automations.yaml
 ```
 
 If one installs Core (anything iterating over `states.update` without excluding Core), it must stop doing so, or it
-will reinstall every release the smart updater skips. Show the human the change from
+will install Core releases the moment they appear, before the preflight and outside the window. Show the human the change from
 `examples/auto_update_except_core.yaml`: a `rejectattr('entity_id', 'eq', 'update.home_assistant_core_update')` in
 each template that lists update entities. Back up `automations.yaml`, edit, `ha core check`, then reload automations
 (Developer tools > YAML > Automations, or a restart). If you cannot tell whether an automation touches Core, ask.

@@ -9,7 +9,7 @@ library only) and one Home Assistant package. No custom integration, no add-on.
   them with the integrations you actually use, and decides: install tonight, or hold and tell you why.
 - **After every start**, the script compares your integrations with a snapshot taken just before the update. If an
   integration that worked before the update is now failing, and still failing ten minutes later, it **rolls Core back
-  to the previous version and skips the bad release.** That rule is fixed code; the AI has no vote on it.
+  to the previous version and blocks the bad release.** That rule is fixed code; the AI has no vote on it.
 - **Then the AI diagnoses it**: it reads the failing integration's log lines, searches GitHub for the error, and
   sends you a plain-English note: the cause, the known bug if there is one, the version that fixes it if known, and
   what to do (usually nothing).
@@ -32,7 +32,7 @@ Core started fine with one dead integration. It stayed broken until a person rol
 (`ha core update --version 2026.10.2`) fixed it, and skipping 2026.10.3 kept the auto-updater from reinstalling it
 within the hour.
 
-This project is that afternoon's work, automated: notice, roll back, skip, find out why, retry when it is fixed.
+This project is that afternoon's work, automated: notice, roll back, block, find out why, retry when it is fixed.
 
 ## Install with a coding agent
 
@@ -74,7 +74,7 @@ the full procedure.
    needed for the new `shell_command`; reloading automations is not enough.
 6. Leave Core out of any other auto-updater. If you run hass-auto-update or similar, add the `rejectattr` line from
    [examples/auto_update_except_core.yaml](examples/auto_update_except_core.yaml) to it. Two installers for Core will
-   fight, and the old one will reinstall a release this one skipped.
+   fight: the old one installs releases the moment they appear, before the preflight and outside the window.
 7. Check it: **Developer tools > Actions**, run `shell_command.smart_updater` with data `cmd: probe`, then read
    `/config/smart_updater/log.txt`. You want `probe supervisor /core/info: ok <version>` and `probe ha /config: ok
    <version>`. Then run it with `cmd: dryrun <latest version>` (for example `cmd: dryrun 2026.10.3`): a minute or two
@@ -95,6 +95,7 @@ not diagnosed until they recover and break again.
 | `window` | `[3, 5]` | install Core updates from 03:00 to before 05:00, Home Assistant's local time |
 | `stuck_min` | `30` | the sweep diagnoses an integration once it has failed this many minutes |
 | `ha_url` | `http://localhost:8123` | Home Assistant's own API as seen from inside the Core container. Change it only for HTTPS (see Limits). |
+| `blocked_versions` | `[]` | versions never to install, for example `["2026.10.3"]`. This is how you block a release by hand. |
 
 `notify` has no safe default. Without it, every run writes `CONFIG ERROR: config.json has no "notify" target` to
 `log.txt`, and the updater still does everything else, rollbacks included; you just are not told. A file that is not
@@ -112,15 +113,27 @@ recognise.
 
 | situation | what happens |
 |---|---|
-| A Core update is pending (checked when it appears, then hourly) | The AI assesses it once per version per day: `RISK: high` or `low`, and, if you have an open problem, `FIXED: yes`, `no` or `unknown`. |
+| A Core release newer than the installed one exists (checked when it appears, then hourly), whether or not it is skipped in Home Assistant | The AI assesses it once per version per day: `RISK: high` or `low`, and, if you have an open problem, `FIXED: yes`, `no` or `unknown`. |
 | The release fixes the problem you rolled back from | Install now. `FIXED: yes` counts only if the AI cites a GitHub issue the script itself found, closed after your problem started. |
-| `RISK: high` | Hold, and tell you why (once per version). |
-| Anything else, AI failure included | Install inside the window. The health check is the safety net either way. |
-| The install is refused twice, or Core comes back on the old version | Skip the release and tell you. It is not retried. |
-| After a start, an integration fails that did not fail before the update | Wait ten minutes and look again. Still failing: diagnose, tell you, roll back to the version from before the update, then skip the bad release after the restart. |
+| The release is blocked (by a failed install, a rollback, or `blocked_versions`) | Never installed. A newer release is assessed normally. |
+| `RISK: high` | Hold, hide the badge, and tell you why (once per version). Reassessed daily. |
+| Anything else, AI failure included | Install inside the window; outside it, hide the badge and wait. The health check is the safety net either way. |
+| The install is refused twice, or Core comes back on the old version | Block the release and tell you. It is not retried. |
+| After a start, an integration fails that did not fail before the update | Wait ten minutes and look again. Still failing: block the release, diagnose, tell you, and roll back to the version from before the update. |
 | The rollback fails | Retry once; then tell you the exact command to run (`ha core update --version <old>`). |
 | After a start, everything that worked still works | Record the version as good and tell you. |
 | Any integration stays failing `stuck_min` minutes, update or not | Diagnose it once and tell you. A recovery resets it, so a relapse is diagnosed again. |
+
+**Badges and skipping.** Home Assistant shows a badge for every pending update. The updater hides it by skipping the
+release in Home Assistant whenever it decides to wait or hold, and installs that release later anyway: install goes
+straight to the Supervisor, which does not care about Home Assistant's skip. So skipping a Core release in the Home
+Assistant UI no longer stops it. To keep a release off your system, add it to `blocked_versions`. The updater's own
+`blocked` list in `state.json` holds the releases it blocked itself.
+
+**What counts as risk.** The preflight tells the AI that only an open issue reported against the new version, for
+an integration you use, is risk; that closed issues are resolved; and that a fix listed in the release notes counts
+against risk. If you have an open problem, the release-note lines that mention its integration are quoted to the AI
+as evidence for `FIXED: yes`.
 
 The AI reads untrusted text (release notes, issue bodies). It can only phrase advice and answer RISK and FIXED; it
 never chooses whether to roll back, and the script never runs anything the AI writes.
@@ -133,8 +146,8 @@ pure logic plus the update flows against a fake Home Assistant.
 - `HA <version> held`: the AI found credible risk for an integration you use. The reason follows.
 - `HA updated to <version>`: installed, and every integration that worked still works.
 - `HA <version> broke <integrations>`: rolling back now, with the diagnosis.
-- `HA rolled back to <version>`: the rollback finished and the bad release is skipped.
-- `HA <version> did not install`: refused, or the Supervisor reverted a failed start. Skipped.
+- `HA rolled back to <version>`: the rollback finished and the bad release is blocked.
+- `HA <version> did not install`: refused, or the Supervisor reverted a failed start. Blocked.
 - `HA rollback FAILED` / `HA still on broken version`: you need to act; the message has the command.
 - `HA: <integrations> broken 30+ min`: the diagnosis of something that broke on its own.
 - `HA smart updater error`: the script itself failed; the error follows.
