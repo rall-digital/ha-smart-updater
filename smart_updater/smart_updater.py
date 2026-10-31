@@ -285,10 +285,41 @@ def selftest():
     assert plain("a\n\nb") == "a b" and len(plain("x" * 900)) == 400
     assert summarize("X\nCAUSE: a\nKNOWN BUG: b\nDO: c") == "CAUSE: a DO: c"
     assert summarize("") == ""
+    selftest_network()
     selftest_config()
     selftest_flows()
     selftest_v2()
     print("selftest ok")
+
+def selftest_network():
+    def st(name, v, eid):
+        return {"entity_id": eid, "state": v, "attributes": {"friendly_name": name}}
+    states = {
+        "sensor.north_cpu": st("North CPU usage", "10", "sensor.north_cpu"),
+        "sensor.north_mem": st("North Memory usage", "85", "sensor.north_mem"),
+        "sensor.north_status": st("North Device status", "connected", "sensor.north_status"),
+        "update.north_fw": st("North Firmware", "off", "update.north_fw"),
+        "sensor.jet_poe1": st("Jetstream Port 1 PoE power", "5.1", "sensor.jet_poe1"),
+        "switch.jet_poe1": st("Jetstream Port 1 PoE", "on", "switch.jet_poe1"),
+        "binary_sensor.r_port4": st("Gigabit VPN Router Port 4 LAN status", "off", "binary_sensor.r_port4"),
+        "device_tracker.phone": st("Phone", "home", "device_tracker.phone"),
+    }
+    p = parse_network(states, list(states))
+    assert [d["name"] for d in p["devices"]] == ["Gigabit VPN Router", "Jetstream", "North"], p["devices"]
+    north = p["devices"][2]
+    assert (north["cpu"], north["mem"], north["status"], north["fw"]) == (10.0, 85.0, "connected", "current"), north
+    assert p["devices"][1]["ports"]["Port 1"] == {"poe_w": 5.1, "poe": "on"}, p["devices"][1]
+    assert p["devices"][0]["ports"]["Port 4"] == {"links": {"LAN status": "off"}}, p["devices"][0]
+    assert p["clients"] == [{"name": "Phone", "state": "home"}], p["clients"]
+    assert parse_network({}, ["a"]) == {"devices": [], "clients": []}
+    assert network_warnings(p) == ["North memory at 85%"], network_warnings(p)
+    h = [{"day": "2026-10-29", "d": {"North": [10.0, 70.0]}},
+         {"day": "2026-10-30", "d": {"North": [10.0, 85.0]}}]
+    assert network_change(h) == ["North memory 70% to 85%"], network_change(h)
+    assert network_change(h[:1]) == [] and network_change(h, step=30) == []     # one sample, or below the step
+    h2 = network_history([{"day": "2026-10-30", "d": {"North": [1.0, 2.0]}}], p, day="2026-10-30")
+    assert len(h2) == 1 and h2[0]["d"]["North"] == [10.0, 85.0], h2               # same day replaces, never doubles
+    assert len([h for h in network_history([], p)]) == 1
 
 def selftest_config():
     import tempfile
@@ -1091,6 +1122,84 @@ def entities_by_platform():
 def network():
     network_read()
 
+def to_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+PORT_NAME = re.compile(r"^(?P<dev>.+?) (?P<port>Port \d+) (?P<what>.+)$")
+
+def parse_network(states, eids):
+    """One record per Omada device, plus the tracked clients. Pure: no I/O, no clock."""
+    devs, clients = {}, []
+    def rec(name):
+        return devs.setdefault(name, {"name": name, "ports": {}})
+    for eid in sorted(eids):
+        st = states.get(eid)
+        if not st:
+            continue
+        name = (st.get("attributes") or {}).get("friendly_name") or eid
+        v = st.get("state")
+        if eid.startswith("device_tracker."):
+            clients.append({"name": name, "state": v})
+        elif name.endswith(" Device status"):
+            rec(name[:-14])["status"] = v
+        elif name.endswith(" Firmware"):
+            rec(name[:-9])["fw"] = "update" if v == "on" else "current"
+        elif name.endswith(" CPU usage"):
+            rec(name[:-10])["cpu"] = to_num(v)
+        elif name.endswith(" Memory usage"):
+            rec(name[:-13])["mem"] = to_num(v)
+        else:
+            m = PORT_NAME.match(name)
+            if not m:
+                continue
+            p = rec(m.group("dev"))["ports"].setdefault(m.group("port"), {})
+            what = m.group("what")
+            if what == "PoE power":
+                p["poe_w"] = to_num(v)
+            elif what == "PoE":
+                p["poe"] = v
+            else:
+                p.setdefault("links", {})[what] = v
+    return {"devices": [devs[k] for k in sorted(devs)], "clients": clients}
+
+def network_warnings(parsed, warn=80.0):
+    """The facts an owner would want named, not the AI's judgement of them."""
+    out = []
+    for d in parsed["devices"]:
+        if d.get("status") and d["status"] != "connected":
+            out.append(f"{d['name']} is {d['status']}")
+        if d.get("cpu") is not None and d["cpu"] >= warn:
+            out.append(f"{d['name']} CPU at {d['cpu']:.0f}%")
+        if d.get("mem") is not None and d["mem"] >= warn:
+            out.append(f"{d['name']} memory at {d['mem']:.0f}%")
+        if d.get("fw") == "update":
+            out.append(f"firmware update available for {d['name']}")
+    return out
+
+def network_history(prev, parsed, day=None, keep=14):
+    """One compact sample a day: device -> [cpu, mem]. Yesterday is kept so change can be named."""
+    day = day or datetime.datetime.now().date().isoformat()
+    hist = [h for h in (prev or []) if h.get("day") != day]
+    hist.append({"day": day,
+                 "d": {d["name"]: [d.get("cpu"), d.get("mem")] for d in parsed["devices"]}})
+    return hist[-keep:]
+
+def network_change(hist, step=5.0):
+    """What moved since the previous sample. Silent below `step` points."""
+    if len(hist) < 2:
+        return []
+    prev, cur = hist[-2].get("d") or {}, hist[-1].get("d") or {}
+    out = []
+    for name, (cpu, mem) in cur.items():
+        old = prev.get(name) or [None, None]
+        for a, b, label in ((old[1], mem, "memory"), (old[0], cpu, "CPU")):
+            if a is not None and b is not None and abs(b - a) >= step:
+                out.append(f"{name} {label} {a:.0f}% to {b:.0f}%")
+    return out
+
 def network_read():
     """Summarise the Omada network for the AI and store a plain-English read. No control, read-only."""
     s = load()
@@ -1106,39 +1215,33 @@ def network_read():
         states = {x["entity_id"]: x for x in ha("/states")}
     except Exception as e:
         return log(f"network: states unavailable ({e!r})")
-    status, cpu, mem, ports, fw, poe, poe_sw, clients = [], [], [], [], [], [], [], []
-    for eid in sorted(eids):
-        st = states.get(eid)
-        if not st:
-            continue
-        n = (st.get("attributes") or {}).get("friendly_name") or eid
-        v = st["state"]
-        if eid.startswith("device_tracker."):
-            clients.append(v)
-        elif eid.startswith("update."):
-            fw.append(f"{n} = {'update available' if v == 'on' else 'up to date'}")
-        elif "poe_power" in eid:
-            poe.append(f"{n} = {v} W")
-        elif eid.startswith("switch."):
-            poe_sw.append(f"{n} = {v}")
-        elif "cpu_usage" in eid:
-            cpu.append(f"{n} = {v} %")
-        elif "memory_usage" in eid:
-            mem.append(f"{n} = {v} %")
-        elif "device_status" in eid:
-            status.append(f"{n} = {v}")
-        elif eid.startswith("binary_sensor."):
-            ports.append(f"{n} = {v}")
-    home = sum(1 for c in clients if c == "home")
-    summary = (
-        "Devices:\n" + ("\n".join(status) or "(none)") +
-        "\nCPU:\n" + ("\n".join(cpu) or "(none)") +
-        "\nMemory:\n" + ("\n".join(mem) or "(none)") +
-        "\nLink and port sensors:\n" + ("\n".join(ports) or "(none)") +
-        "\nFirmware:\n" + ("\n".join(fw) or "(none)") +
-        "\nPoE power:\n" + ("\n".join(poe) or "(none)") +
-        "\nPoE switches:\n" + ("\n".join(poe_sw) or "(none)") +
-        f"\nTracked clients: {len(clients)} present, {home} home")
+    parsed = parse_network(states, eids)
+    if not parsed["devices"]:
+        return log("network: no device entities")
+    hist = network_history((s.get("network") or {}).get("history"), parsed)
+    change, warns = network_change(hist), network_warnings(parsed)
+    lines = []
+    for d in parsed["devices"]:
+        bits = [d.get("status") or "status unknown"]
+        if d.get("cpu") is not None:
+            bits.append(f"CPU {d['cpu']:.0f}%")
+        if d.get("mem") is not None:
+            bits.append(f"memory {d['mem']:.0f}%")
+        if d.get("fw"):
+            bits.append(f"firmware {d['fw']}")
+        for port, p in sorted(d["ports"].items()):
+            if p.get("poe_w"):                          # 0.0 W on an idle port is not a fact worth a line
+                bits.append(f"{port} PoE {p['poe_w']:.1f} W")
+            for what, val in sorted((p.get("links") or {}).items()):
+                bits.append(f"{port} {what} {val}")
+        lines.append(f"- {d['name']}: " + "; ".join(bits))
+    names = [c["name"] for c in parsed["clients"]]
+    home = sum(1 for c in parsed["clients"] if c["state"] == "home")
+    summary = ("Devices:\n" + "\n".join(lines) +
+               f"\n\nClients seen on the network: {len(names)}, {home} home" +
+               (": " + ", ".join(names) if names else "") +
+               "\nWarnings: " + ("; ".join(warns) if warns else "none") +
+               "\nSince the last check: " + ("; ".join(change) if change else "nothing notable"))
     prompt = f"""You are the network operator for a home. Below is the live state of its TP-Link Omada network
 as reported by Home Assistant.
 
@@ -1146,14 +1249,16 @@ as reported by Home Assistant.
 
 Write a short plain-English read for the owner, exactly in this shape:
 OVERALL: healthy / degraded / down
-- up to five bullets covering: the devices and whether all are connected; CPU and memory (name anything at or
-  above 80 %); WAN and LAN link status (name any port that is off); firmware; PoE. Then the one thing worth doing,
-  if anything. Use the numbers above. Do not invent data. No preamble, no markdown headings."""
+- up to five bullets covering: whether every device is connected; CPU and memory, naming anything at or above
+  80 %; any port that is off and what that likely means; firmware; PoE. Then the one thing worth doing, if any.
+Use only the numbers above. Mention a change only if the "since the last check" line lists one. No preamble,
+no markdown headings."""
     text = ai("smart_updater_network", prompt) or "The AI did not answer."
-    s["network"] = {"at": now, "entities": sum(len(x) for x in (status, cpu, mem, ports, fw, poe, poe_sw)) + len(clients),
-                    "report": text}
+    s["network"] = {"at": now, "entities": len(eids), "devices": parsed["devices"],
+                    "clients": {"tracked": len(names), "home": home, "names": names},
+                    "warnings": warns, "change": change, "history": hist, "report": text}
     save(s)
-    log(f"network: report entities={len(rows)}")
+    log(f"network: report devices={len(parsed['devices'])} clients={len(names)} warnings={len(warns)}")
     write_status()
 
 def addons_health(s):

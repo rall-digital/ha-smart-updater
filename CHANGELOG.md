@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.4.0
+
+- **Deeper network read.** The `network` command now builds one record per device — status, CPU, memory, firmware,
+  every port's link state and PoE draw — instead of flat lists, and keeps a 14-day history so the read can say what
+  changed since the last check. Warnings (a device off, CPU or memory at 80 %, a firmware update) are computed
+  locally and handed to the AI as facts, not left for it to spot.
+- **Fix:** `network` raised `NameError: name 'rows' is not defined` after saving, so every run logged a failure even
+  though the report was written. The error streak now clears.
+
 ## 2.3.0
 
 - **Network read.** A new `network` command summarises the TP-Link Omada network (devices, CPU/memory, WAN and LAN
