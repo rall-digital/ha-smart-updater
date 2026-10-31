@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.5.1
+
+- **Fix:** the silent test counted stateless entities as failures. Buttons, scenes and input buttons are `unknown`
+  until pressed, so every job's "down" count was inflated by things that cannot be up. They are now excluded: on
+  this house the Network job went from 20 down to 4, and 4 is the truth (sensors the hardware does not report).
+- The `Network` job now covers both Omada integrations (`tplink_omada` and `omada_open_api`), so the Open API side is
+  watched the same way as the rest.
+
 ## 2.5.0
 
 - **Deep network read.** The `network` command now asks the controller itself, through the library the Omada

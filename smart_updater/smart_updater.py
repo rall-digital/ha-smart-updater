@@ -285,6 +285,8 @@ def selftest():
     assert plain("a\n\nb") == "a b" and len(plain("x" * 900)) == 400
     assert summarize("X\nCAUSE: a\nKNOWN BUG: b\nDO: c") == "CAUSE: a DO: c"
     assert summarize("") == ""
+    assert is_stateless("button.north_reboot") and is_stateless("scene.rall_on")
+    assert not is_stateless("sensor.north_cpu_usage") and not is_stateless("binary_sensor.south_status")
     selftest_network()
     selftest_deep()
     selftest_config()
@@ -1415,6 +1417,10 @@ def addons_health(s):
                    f"An add-on is not running: {slug} ({why}). Check its log.", key=f"addon_down:{slug}")
     log(f"addons: bad={[':'.join(b) for b in bad]}")
 
+def is_stateless(eid):
+    """Entities that are only ever unknown until you press them: never a liveness signal."""
+    return eid.startswith(("button.", "scene.", "input_button."))
+
 def shadow_health(s):
     """The Truth Audit, in shadow: per-job device liveness. Writes would_speak to state; never notifies."""
     by_plat = entities_by_platform()
@@ -1433,6 +1439,8 @@ def shadow_health(s):
             if d in IGNORE:
                 continue
             for eid in by_plat.get(d, []):
+                if is_stateless(eid):
+                    continue                     # "unknown" on a thing you press is not a fault
                 st = states.get(eid)
                 if not st:
                     continue
