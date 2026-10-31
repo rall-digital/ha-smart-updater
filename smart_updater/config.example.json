@@ -2,8 +2,16 @@
   "notify": "notify.mobile_app_your_phone",
   "ai_entity": "ai_task.openai_ai_task",
   "core_update": "update.home_assistant_core_update",
-  "window": [3, 5],
+  "window": [
+    3,
+    5
+  ],
+  "soak_hours": 168,
   "stuck_min": 30,
+  "stall_min": 15,
+  "ignore": [],
   "ha_url": "http://localhost:8123",
-  "blocked_versions": []
+  "www_dir": "/config/www",
+  "blocked_versions": [],
+  "watch": []
 }

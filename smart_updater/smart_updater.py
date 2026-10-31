@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Smart updater for Home Assistant Core. Runs inside HA core via shell_command.
 
-  preflight  core update pending: AI reads release notes + GitHub issues; hold, install now, or wait for the window
+  preflight  core update pending: AI reads release notes + GitHub issues; soak, hold, install now, or wait for the window
   check      on HA start: diff failing integrations vs pre-update snapshot; new failure -> roll back + block + AI diagnosis
-  sweep      every 30 min: any integration failing 30+ min that we haven't diagnosed -> AI diagnosis
+  sweep      every 30 min: a NEW integration failure that had been healthy -> one plain-text alert
+  heartbeat  every minute: liveness file; a gap over stall_min is reported once, with an incident snapshot
+  backup_health  daily: newest Supervisor backup under 36h old and containing the HA config
+  status     rewrite /config/www/smart_updater_status.json for the dashboard
   selftest   assert-based checks of the pure logic (no network)
 
 Rollback is deterministic; the AI only advises/diagnoses. State: state.json next to this file.
 Settings: config.json next to this file (see README). MIT License, (c) 2026 RALL DIGITAL LLC."""
-import datetime, json, os, platform, re, sys, time, urllib.error, urllib.parse, urllib.request
+import datetime, json, os, platform, re, shutil, sys, time, urllib.error, urllib.parse, urllib.request
 from collections import Counter
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,13 +23,19 @@ DEFAULTS = {"ai_entity": "ai_task.openai_ai_task",            # any ai_task enti
             "notify": None,                                    # e.g. "notify.mobile_app_my_phone"; no safe default
             "core_update": "update.home_assistant_core_update",
             "window": [3, 5],                                  # install core updates between 03:00 and 05:00 local
-            "stuck_min": 30,                                   # sweep: diagnose an integration after it has failed this long
+            "soak_hours": 168,                                 # wait this long after a release before installing it (0 = off)
+            "stuck_min": 30,                                   # sweep: an integration failing this long is eligible to alert
+            "stall_min": 15,                                   # heartbeat: a gap this long is a stall worth reporting
+            "ignore": [],                                      # domains that are known-broken and must never alert
+            "watch": [],                                       # domains always shown on the dashboard, healthy or not
+            "jobs": {},                                        # the house's jobs: {"Lights": ["lutron_caseta", "hue"]}
             "ha_url": "http://localhost:8123",                 # HA's own API, as seen from inside the core container
+            "www_dir": "/config/www",                          # where the dashboard's status JSON is written
             "blocked_versions": []}                            # versions a human never wants installed, e.g. ["2026.10.3"]
 
 def load_config(path):
-    """(AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, BLOCKED_VERSIONS, problems). Never raises: a bad file falls back to the
-    defaults, so check() can still roll back; the problems are logged on every run."""
+    """All settings as a tuple in module order, plus a list of problems. Never raises: a bad file falls back to
+    the defaults, so check() can still roll back; the problems are logged on every run."""
     problems = []
     try:
         c = json.load(open(path))
@@ -56,9 +65,34 @@ def load_config(path):
     if not (isinstance(blocked, list) and all(isinstance(v, str) for v in blocked)):
         problems.append(f"config.json: blocked_versions must be a list of version strings, got {blocked!r}; ignored")
         blocked = []
-    return c["ai_entity"], notify, c["core_update"], window, stuck, ha_url, tuple(blocked), problems
+    try:
+        soak, stall = int(c["soak_hours"]), int(c["stall_min"])
+        assert soak >= 0 and stall > 0
+    except (TypeError, ValueError, AssertionError):
+        problems.append(f"config.json: bad soak_hours {c['soak_hours']!r} or stall_min {c['stall_min']!r}; using defaults")
+        soak, stall = DEFAULTS["soak_hours"], DEFAULTS["stall_min"]
+    ignored = c["ignore"]
+    if not (isinstance(ignored, list) and all(isinstance(v, str) for v in ignored)):
+        problems.append(f"config.json: ignore must be a list of domain strings, got {ignored!r}; ignored")
+        ignored = []
+    watch = c["watch"]
+    if not (isinstance(watch, list) and all(isinstance(v, str) for v in watch)):
+        problems.append(f"config.json: watch must be a list of domain strings, got {watch!r}; ignored")
+        watch = []
+    jobs = c["jobs"]
+    if not (isinstance(jobs, dict) and all(isinstance(k, str) and isinstance(v, list)
+                                          and all(isinstance(d, str) for d in v) for k, v in jobs.items())):
+        problems.append(f"config.json: jobs must map a name to a list of domains, got {jobs!r}; ignored")
+        jobs = {}
+    www = c["www_dir"]
+    if not (isinstance(www, str) and www):
+        problems.append(f"config.json: bad www_dir {c['www_dir']!r}; using {DEFAULTS['www_dir']}")
+        www = DEFAULTS["www_dir"]
+    return (c["ai_entity"], notify, c["core_update"], window, soak, stuck, stall, ha_url,
+            tuple(blocked), tuple(ignored), tuple(watch), dict(jobs), www, problems)
 
-AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, STUCK_MIN, HA_URL, BLOCKED_VERSIONS, CONFIG_PROBLEMS = load_config(os.path.join(DIR, "config.json"))
+(AI_ENTITY, NOTIFY, CORE_UPDATE, WINDOW, SOAK_HOURS, STUCK_MIN, STALL_MIN, HA_URL, BLOCKED_VERSIONS,
+ IGNORE, WATCH, JOBS, WWW_DIR, CONFIG_PROBLEMS) = load_config(os.path.join(DIR, "config.json"))
 FAILING = ("setup_error", "setup_retry", "migration_error")
 STALE_MIN = 120          # a pre-update snapshot older than this means check() never ran for that install
 SETTLE_MIN = 15          # pre younger than this at check() time: the install hasn't been applied yet
@@ -106,16 +140,50 @@ def fix_lines(notes, domains, top=10):
     keys = {k for d in domains for k in (d.lower(), d.lower().replace("_", "-"), d.split("_")[0].lower()) if len(k) >= 3}
     return [l.strip() for l in (notes or "").splitlines() if any(k in l.lower() for k in keys)][:top]
 
-def decide(ai, open_issue, hour):
-    if open_issue and ai["fixed"] == "yes":
-        return "install"
+def decide(ai, hour, soak_left=0):
+    """install | wait | hold. Soak first; a high risk always holds, even for a release that fixes our old problem;
+    otherwise install only inside the window. FIXED is informational and never jumps either rule."""
+    if soak_left > 0:
+        return "wait"
     if ai["risk"] == "high":
         return "hold"
     return "install" if WINDOW[0] <= hour < WINDOW[1] else "wait"
 
+def parse_dt(s):
+    return datetime.datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+
+def soak_remaining(cache):
+    """Hours left before this release may install. Unknown publish date holds the full soak (conservative)."""
+    if SOAK_HOURS <= 0:
+        return 0.0
+    pub = (cache or {}).get("published_at")
+    if not pub:
+        return float(SOAK_HOURS)
+    try:
+        p = parse_dt(pub)
+    except (ValueError, TypeError, AttributeError):
+        return float(SOAK_HOURS)
+    now = datetime.datetime.now(p.tzinfo) if p.tzinfo else datetime.datetime.now()
+    return max(0.0, SOAK_HOURS - (now - p).total_seconds() / 3600)
+
+def plain(text, limit=400):
+    """AI markdown -> one plain line for an iPhone notification."""
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", text or "")
+    t = re.sub(r"(?m)^\s*#+\s*", "", t)                # heading markers only; keep issue numbers like #1
+    t = re.sub(r"[*`]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:limit]
+
+def summarize(diag, limit=320):
+    """Keep the two lines a person acts on, not the AI's whole scratchpad."""
+    lines = [re.sub(r"[*_`#]+", "", l).strip() for l in (diag or "").splitlines() if l.strip()]
+    keep = [l for l in lines if re.match(r"(CAUSE|DO)\s*:", l, re.I)][:2] or lines[:2]
+    return plain(" ".join(keep), limit)
+
 def selftest():
-    global WINDOW
-    WINDOW = tuple(DEFAULTS["window"])                 # the asserts below assume the default window, whatever config.json says
+    global WINDOW, SOAK_HOURS
+    WINDOW = tuple(DEFAULTS["window"])                 # the asserts below assume the default settings, whatever config.json says
+    SOAK_HOURS = DEFAULTS["soak_hours"]
     entries = [{"entry_id": "a", "domain": "lutron_caseta", "state": "setup_retry"},
                {"entry_id": "b", "domain": "wyoming", "state": "setup_retry"},
                {"entry_id": "c", "domain": "hue", "state": "loaded"},
@@ -139,15 +207,30 @@ def selftest():
     assert parse_ai("RISK: low\nFIXED: yes")["fixed"] == "unknown"                 # audit #7: uncited yes
     assert parse_ai(f"RISK: low\nFIXED: yes per {u}", {u})["fixed"] == "yes"
     assert parse_ai(f"FIXED: yes per {u}64", {u})["fixed"] == "unknown"           # re-review #7a: no substring match
-    assert decide({"risk": "high", "fixed": "yes"}, {"x": 1}, 14) == "install"   # fix for our open issue: go now
-    assert decide({"risk": "high", "fixed": None}, None, 4) == "hold"
-    assert decide({"risk": None, "fixed": None}, None, 4) == "install"            # AI failed -> window + canary
-    assert decide({"risk": "low", "fixed": "no"}, {"x": 1}, 14) == "wait"
+    assert decide({"risk": "high", "fixed": "yes"}, 4) == "hold"                 # a fix never outranks a new risk
+    assert decide({"risk": "high", "fixed": None}, 4) == "hold"
+    assert decide({"risk": None, "fixed": None}, 4) == "install"                  # AI failed -> window + canary
+    assert decide({"risk": "low", "fixed": "no"}, 14) == "wait"
+    assert decide({"risk": "low", "fixed": "yes"}, 14) == "wait"                  # a fix waits for the window
+    assert decide({"risk": "low", "fixed": "yes"}, 4) == "install"
     notes = "## Fixes\n- Bump pylutron-caseta to 0.30.0 (#188388)\n- Fix hue scenes (#1)\n"
     assert fix_lines(notes, ["lutron_caseta"]) == ["- Bump pylutron-caseta to 0.30.0 (#188388)"]
     assert fix_lines(notes, []) == [] and fix_lines("", ["hue"]) == []
+    # v2: soak gate, plain-text formatter, summarizer
+    hours_ago = lambda h: (datetime.datetime.now() - datetime.timedelta(hours=h)).isoformat()
+    assert soak_remaining({"published_at": hours_ago(1)}) > 160
+    assert soak_remaining({"published_at": hours_ago(200)}) == 0
+    assert soak_remaining({}) == float(SOAK_HOURS)                                # unknown publish date holds
+    assert soak_remaining({"published_at": "garbage"}) == float(SOAK_HOURS)
+    assert decide({"risk": "low", "fixed": None}, 4, soak_left=10) == "wait"
+    assert decide({"risk": "low", "fixed": None}, 4, soak_left=0) == "install"
+    assert plain("**CAUSE:** boom\n[issue #1](https://x/1)") == "CAUSE: boom issue #1 (https://x/1)"
+    assert plain("a\n\nb") == "a b" and len(plain("x" * 900)) == 400
+    assert summarize("X\nCAUSE: a\nKNOWN BUG: b\nDO: c") == "CAUSE: a DO: c"
+    assert summarize("") == ""
     selftest_config()
     selftest_flows()
+    selftest_v2()
     print("selftest ok")
 
 def selftest_config():
@@ -159,31 +242,41 @@ def selftest_config():
             f.write(text)
         return load_config(p)
     *vals, probs = load_config(os.path.join(d, "missing.json"))
-    assert vals == ["ai_task.openai_ai_task", None, "update.home_assistant_core_update", (3, 5), 30,
-                    "http://localhost:8123", ()], vals
+    assert vals == ["ai_task.openai_ai_task", None, "update.home_assistant_core_update", (3, 5), 168, 30, 15,
+                    "http://localhost:8123", (), (), (), {}, "/config/www"], vals
     assert len(probs) == 1 and "notify" in probs[0]                                  # missing NOTIFY is loud
     *vals, probs = cfg('{"notify": "notify.mobile_app_x", "ai_entity": "ai_task.y", "window": [1, 2], "stuck_min": 5}')
-    assert vals == ["ai_task.y", "notify/mobile_app_x", "update.home_assistant_core_update", (1, 2), 5,
-                    "http://localhost:8123", ()] and probs == []
-    assert cfg('{"notify": "notify.a", "blocked_versions": ["2026.1.1"]}')[6] == ("2026.1.1",)
+    assert vals == ["ai_task.y", "notify/mobile_app_x", "update.home_assistant_core_update", (1, 2), 168, 5, 15,
+                    "http://localhost:8123", (), (), (), {}, "/config/www"] and probs == []
+    assert cfg('{"notify": "notify.a", "blocked_versions": ["2026.1.1"]}')[8] == ("2026.1.1",)
     *vals, probs = cfg('{"notify": "notify.a", "blocked_versions": "2026.1.1"}')
-    assert vals[6] == () and any("blocked_versions" in p for p in probs)
-    assert cfg('{"notify": "notify.a", "ha_url": "https://localhost:8123/"}')[5] == "https://localhost:8123"
+    assert vals[8] == () and any("blocked_versions" in p for p in probs)
+    assert cfg('{"notify": "notify.a", "ha_url": "https://localhost:8123/"}')[7] == "https://localhost:8123"
     *vals, probs = cfg('{"notify": "notify.a", "ha_url": "localhost:8123"}')
-    assert vals[5] == "http://localhost:8123" and any("bad ha_url" in p for p in probs)
+    assert vals[7] == "http://localhost:8123" and any("bad ha_url" in p for p in probs)
     assert cfg('{"notify": "notify/a"}')[1] == "notify/a"                             # service-path form also works
     *vals, probs = cfg("{not json")
     assert vals[3] == (3, 5) and any("unreadable" in p for p in probs)                # bad file -> defaults, still runs
     *vals, probs = cfg('{"notify": "notify.a", "notfy": 1, "window": [5, 3]}')
     assert vals[3] == (3, 5) and any("'notfy'" in p for p in probs) and any("bad window" in p for p in probs)
     assert cfg("[]")[-1] and cfg('{"window": "3-5", "notify": "notify.a"}')[3] == (3, 5)
+    *vals, probs = cfg('{"notify": "notify.a", "soak_hours": -1, "stall_min": 0, "ignore": "wyoming"}')
+    assert vals[4] == 168 and vals[6] == 15 and vals[9] == () and len(probs) >= 2
+    assert cfg('{"notify": "notify.a", "soak_hours": 0, "ignore": ["wyoming"], "www_dir": "/tmp/w"}')[4] == 0
+    assert cfg('{"notify": "notify.a", "ignore": ["wyoming"], "www_dir": "/tmp/w"}')[9] == ("wyoming",)
+    assert cfg('{"notify": "notify.a", "watch": ["lutron_caseta"]}')[10] == ("lutron_caseta",)
+    assert cfg('{"notify": "notify.a", "jobs": {"Lights": ["hue"]}}')[11] == {"Lights": ["hue"]}
+    *vals, probs = cfg('{"notify": "notify.a", "jobs": {"Lights": "hue"}}')
+    assert vals[11] == {} and any("jobs" in p for p in probs)
+    *vals, probs = cfg('{"notify": "notify.a", "watch": "lutron_caseta"}')
+    assert vals[10] == () and any("watch" in p for p in probs)
 
 def selftest_flows():
     """check()/preflight()/sweep() against a fake HA, in a temp state dir."""
     import tempfile
     g = globals()
     saved = {k: g[k] for k in ("STATE", "LOG", "version", "entries", "ha", "service", "sup", "notify", "diagnose", "gh_issues", "ai", "http",
-                               "BLOCKED_VERSIONS")}
+                               "BLOCKED_VERSIONS", "SOAK_HOURS", "IGNORE", "write_status")}
     fake = {"v": "1.0", "entries": [], "calls": [], "latest": "1.1", "now": datetime.datetime(2026, 1, 1, 4, 0),
             "skipped": None, "ai": "RISK: low"}
     class FakeDT(datetime.datetime):
@@ -203,9 +296,9 @@ def selftest_flows():
             fake["skipped"] = fake["latest"]
     g.update(STATE=os.path.join(d, "s.json"), LOG=os.path.join(d, "log"), version=lambda: fake["v"],
              entries=lambda: fake["entries"], ha=fha, sup=fsup, gh_issues=lambda *a, **k: [], ai=lambda *a: fake["ai"],
-             service=fservice, BLOCKED_VERSIONS=(),
-             notify=lambda t, m: fake["calls"].append(("notify", t)), diagnose=lambda ds: "diag",
-             http=lambda *a, **k: {"body": ""})
+             service=fservice, BLOCKED_VERSIONS=(), SOAK_HOURS=0, IGNORE=(), write_status=lambda: None,
+             notify=lambda kind, title, message, key=None, urgent=False: fake["calls"].append(("notify", kind, title)),
+             diagnose=lambda ds: "diag", http=lambda *a, **k: {"body": ""})
     datetime.datetime, time.sleep = FakeDT, lambda s: None
     def installs(): return sum(1 for c in fake["calls"] if c[0] == "/core/update" and (c[1] or {}).get("backup"))
     try:
@@ -244,7 +337,7 @@ def selftest_flows():
         fake.update(calls=[], v="1.3", entries=[{"entry_id": "z", "domain": "zha", "state": "setup_error"}])
         check()
         assert ("/core/update", {"version": "1.2", "backup": False}) in fake["calls"], fake["calls"]
-        assert ("notify", "HA rolled back to 1.3") not in fake["calls"]
+        assert not any(c[0] == "notify" and c[2] == "HA: rolled back to 1.3" for c in fake["calls"])
         skip = ("update/skip", {"entity_id": CORE_UPDATE})
         def fresh(at, **kw):
             fake.update({"calls": [], "v": "1.0", "latest": "1.1", "skipped": None, "entries": [], "ai": "RISK: low", "now": at, **kw})
@@ -277,28 +370,167 @@ def selftest_flows():
         fake["now"] += datetime.timedelta(minutes=30)
         preflight()
         assert installs() == 1, "reinstalled a failed version"
-        # v1.1 (d): a hold skips and notifies once
+        # v2: a hold skips and stays quiet (holds are dashboard-only now)
         fresh(datetime.datetime(2026, 2, 5, 4, 0), ai="RISK: high")
         preflight()
         fake.update(skipped=None)
         fake["now"] += datetime.timedelta(hours=1)
         preflight()
         assert installs() == 0 and fake["calls"].count(skip) == 2
-        assert fake["calls"].count(("notify", "HA 1.1 held")) == 1, fake["calls"]
+        assert not [c for c in fake["calls"] if c[0] == "notify"], fake["calls"]
         # v1.1: a rolled-back bad version is blocked
         fresh(datetime.datetime(2026, 2, 6, 4, 0), v="1.1", entries=[{"entry_id": "x", "domain": "hue", "state": "setup_retry"}])
         save({"last_good": "1.0", "pre": {"version": "1.0", "failing": {}, "at": (fake["now"] - datetime.timedelta(minutes=20)).isoformat()}})
         check()
         assert "1.1" in load()["blocked"]
-        # v1.1 upgrade: a 1.0 state (no `blocked`) whose release was skipped in HA never installs it after the upgrade
+        # v1.1 upgrade: a 1.0 state (no `blocked`) migrates only the bad version; HA's skip is NOT a block
         fresh(datetime.datetime(2026, 2, 7, 4, 0), skipped="1.1")
         save({"last_good": "1.0", "bad_version": "0.9"})
         preflight()
+        assert load()["blocked"] == ["0.9"] and installs() == 1, fake["calls"]
+        assert [c for c in fake["calls"] if c[0] == "notify"] == []       # migration is logged, never pushed
+        # v2: a release inside its 7-day soak waits and hides the badge, even inside the window
+        fresh(datetime.datetime(2026, 2, 8, 4, 0))
+        g["SOAK_HOURS"] = 168
+        save({"preflight": {"version": "1.1", "date": fake["now"].date().isoformat(),
+                            "ai": {"risk": "low", "fixed": None},
+                            "published_at": (fake["now"] - datetime.timedelta(hours=1)).isoformat()}})
         preflight()
-        assert installs() == 0 and load()["blocked"] == ["0.9", "1.1"], fake["calls"]
-        assert [c for c in fake["calls"] if c[0] == "notify"] == [("notify", "Smart updater upgraded to 1.1")]
+        assert installs() == 0 and skip in fake["calls"], fake["calls"]
+        g["SOAK_HOURS"] = 0
     finally:
         datetime.datetime, time.sleep = real_dt, real_sleep
+        g.update(saved)
+
+def selftest_v2():
+    """notify render/dedupe, sweep health rules, status JSON - against a fake HA."""
+    import tempfile
+    g = globals()
+    keys = ("STATE", "LOG", "NOTIFY", "service", "version", "entries", "ha", "sup", "diagnose",
+            "write_status", "SOAK_HOURS", "IGNORE", "WATCH", "JOBS", "WWW_DIR", "STUCK_MIN")
+    saved = {k: g[k] for k in keys}
+    d = tempfile.mkdtemp()
+    calls = []
+    fake = {"v": "1.0", "entries": [], "now": datetime.datetime(2026, 3, 1, 12, 0)}
+    class FakeDT(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None): return fake["now"]
+    real_dt = datetime.datetime
+    def fha(path, *a, **kw):
+        if path.startswith("/states/"):
+            return {"state": "off", "attributes": {"latest_version": "1.1", "installed_version": fake["v"]}}
+        if path == "/config":
+            return {"version": fake["v"]}
+        return {}
+    g.update(STATE=os.path.join(d, "s.json"), LOG=os.path.join(d, "log"), NOTIFY="notify/mobile_app_x",
+             service=lambda ds, data, **kw: calls.append((ds, data)), version=lambda: fake["v"],
+             entries=lambda: fake["entries"], ha=fha, sup=lambda *a, **kw: {},
+             diagnose=lambda ds: "CAUSE: upstream\nDO: nothing", STUCK_MIN=30, SOAK_HOURS=0,
+             IGNORE=("wyoming",), WWW_DIR=os.path.join(d, "www"))
+    datetime.datetime = FakeDT
+    try:
+        notify("k", "t", "**hello** [i](https://x)", key="k")
+        assert calls[-1][1]["message"] == "hello i (https://x)", calls[-1]
+        assert calls[-1][1]["data"]["push"]["interruption-level"] == "passive"
+        notify("k", "t", "again", key="k")
+        assert len(calls) == 1, calls
+        notify("k", "t", "urgent", key="k", urgent=True)
+        assert len(calls) == 2 and calls[-1][1]["data"]["push"]["interruption-level"] == "time-sensitive"
+        # a stale caller save must not wipe the dedupe log written by notify (review #3)
+        save({})
+        notify("race", "t", "one", key="race")
+        stale = load()
+        notify("race2", "t", "two", key="race2")
+        save(stale)                                            # snapshot taken before race2 was logged
+        assert "race2" in (load().get("notify_log") or {}), load().get("notify_log")
+        calls.clear()
+        # sweep: no healthy history = quiet
+        save({"first_seen": {}, "diagnosed": {},
+              "health": {"hue": {"down_since": fake["now"].isoformat()}}})
+        fake["entries"] = [{"entry_id": "a", "domain": "hue", "state": "setup_retry"}]
+        sweep()
+        assert not [c for c in calls if c[0] == "notify/mobile_app_x"], calls[-3:]
+        # an ignored domain never alerts, even with a clean history
+        save({"first_seen": {}, "diagnosed": {},
+              "health": {"wyoming": {"down_since": (fake["now"] - datetime.timedelta(hours=1)).isoformat(),
+                                     "ok_since": (fake["now"] - datetime.timedelta(hours=9)).isoformat()}}})
+        fake["entries"] = [{"entry_id": "b", "domain": "wyoming", "state": "setup_retry"}]
+        sweep()
+        assert not [c for c in calls if c[0] == "notify/mobile_app_x"], calls[-3:]
+        # healthy 8 h then failing: one alert, one per down-streak
+        save({"first_seen": {}, "diagnosed": {},
+              "health": {"hue": {"down_since": (fake["now"] - datetime.timedelta(hours=1)).isoformat(),
+                                 "ok_since": (fake["now"] - datetime.timedelta(hours=9)).isoformat()}}})
+        fake["entries"] = [{"entry_id": "a", "domain": "hue", "state": "setup_retry"}]
+        sweep()
+        n = len([c for c in calls if c[0] == "notify/mobile_app_x"])
+        assert n == 1, calls
+        sweep()
+        assert len([c for c in calls if c[0] == "notify/mobile_app_x"]) == n, calls
+        # a healthy streak accumulates across sweeps (regression: ok_since must not reset every run)
+        calls.clear()
+        fake["now"] += datetime.timedelta(hours=1)
+        fake["entries"] = [{"entry_id": "z", "domain": "zha", "state": "loaded"}]
+        save({})
+        sweep()                                            # baseline, healthy
+        t0 = fake["now"]
+        fake["now"] += datetime.timedelta(hours=3)
+        sweep()                                            # still healthy
+        assert load()["health"]["zha"]["ok_since"] == t0.isoformat(), load()["health"]["zha"]
+        fake["now"] += datetime.timedelta(hours=4)         # 7 h since t0
+        fake["entries"] = [{"entry_id": "z", "domain": "zha", "state": "setup_retry"}]
+        sweep()                                            # first failing sample: too fresh to alert
+        assert not [c for c in calls if c[0] == "notify/mobile_app_x"], calls
+        fake["now"] += datetime.timedelta(minutes=31)      # past stuck_min
+        sweep()
+        assert [c for c in calls if c[0] == "notify/mobile_app_x"], calls
+        # backup health: no backups at all is the worst case and must alert (review #5)
+        calls.clear()
+        g["sup"] = lambda *a, **kw: {"data": {"backups": []}}
+        backup_health()
+        assert [c for c in calls if c[0] == "notify/mobile_app_x"], calls
+        assert load()["backup"]["ok"] is False
+        # watched domains are recorded even when healthy (the dashboard always shows them)
+        g["WATCH"] = ("hue", "not_a_thing")
+        fake["entries"] = [{"entry_id": "a", "domain": "hue", "state": "loaded"}]
+        save({"first_seen": {}, "diagnosed": {}, "health": {}})
+        sweep()
+        w = {i["domain"]: i["state"] for i in load()["last_watched"]}
+        assert w == {"hue": "loaded", "not_a_thing": "not set up"}, w
+        g["WATCH"] = ()
+        # jobs aggregate their domains: one broken domain breaks the whole job
+        g["JOBS"] = {"Lights": ("hue",), "Climate": ("intesisbox",)}
+        fake["entries"] = [{"entry_id": "a", "domain": "hue", "state": "setup_retry"},
+                           {"entry_id": "b", "domain": "intesisbox", "state": "loaded"}]
+        save({"first_seen": {}, "diagnosed": {}, "health": {}})
+        sweep()
+        j = {x["name"]: x for x in load()["last_jobs"]}
+        assert j["Lights"]["state"] == "not working" and j["Lights"]["broken"] == ["hue"], j
+        assert j["Climate"]["state"] == "working", j
+        g["JOBS"] = {}
+        # 30-day strip: a problem outranks an update; quiet days are green
+        today = datetime.date.today()
+        save({"first_run": (today - datetime.timedelta(days=30)).isoformat(),
+              "daily": {today.isoformat(): {"updates": 1},
+                        (today - datetime.timedelta(days=1)).isoformat(): {"rollbacks": 1}}})
+        strip, summ = build_strip(load())
+        assert strip[-1] == "u" and strip[-2] == "r" and strip[0] == "g" and len(strip) == 30, strip
+        assert summ == {"quiet": 28, "updates": 1, "problems": 1}, summ
+        # a fresh install must not invent days before it existed
+        save({"first_run": today.isoformat(), "daily": {}})
+        strip2, summ2 = build_strip(load())
+        assert len(strip2) == 1 and strip2 == ["g"] and summ2 == {"quiet": 1, "updates": 0, "problems": 0}
+        # status JSON shape
+        calls.clear()
+        write_status()
+        js = json.load(open(os.path.join(g["WWW_DIR"], "smart_updater_status.json")))
+        for key in ("state", "installed", "pending", "soak_hours", "soak_remaining_hours", "verdict",
+                    "blocked", "window", "failing", "ignored_failing", "watched", "jobs", "strip", "strip_summary",
+                    "last_event", "recent_log",
+                    "backup_ok", "updated"):
+            assert key in js, (key, js)
+    finally:
+        datetime.datetime = real_dt
         g.update(saved)
 
 # ---------- side effects ----------
@@ -328,12 +560,37 @@ def ha(path, method="GET", body=None, timeout=60):
 def service(domain_service, data, response=False, timeout=60):
     return ha(f"/services/{domain_service}" + ("?return_response" if response else ""), "POST", data, timeout)
 
-def notify(title, message):
-    log(f"NOTIFY {title}: {message[:500]}")
+def notify(kind, title, message, key=None, urgent=False):
+    """One plain-text push. Same key at most once per 24 h unless urgent. Every call is logged first."""
+    msg = plain(message)
+    key = key or kind
+    log(f"NOTIFY {kind} [{title}] {msg[:300]}")
     if not NOTIFY:
         return log('notify skipped: no "notify" target in config.json')
     try:
-        service(NOTIFY, {"title": title, "message": message[:1500]})
+        s = load()
+        now = datetime.datetime.now()
+        logbook = s.setdefault("notify_log", {})
+        try:
+            fresh = (now - parse_dt(logbook.get(key) or "")).total_seconds() < 24 * 3600
+        except (ValueError, TypeError):
+            fresh = False
+        if fresh and not urgent:
+            return log(f"notify skipped (dedupe) key={key}")
+        data = {"push": {"interruption-level": "time-sensitive" if urgent else "passive"}}
+        service(NOTIFY, {"title": title, "message": msg, "data": data})
+        s = load()                                 # record only after a successful send: a failure retries
+        logbook = s.setdefault("notify_log", {})
+        logbook[key] = now.isoformat()
+        pruned = {}
+        for k, v in logbook.items():
+            try:
+                if (now - parse_dt(v)).total_seconds() < 7 * 86400:
+                    pruned[k] = v
+            except (ValueError, TypeError):
+                pass
+        s["notify_log"] = pruned
+        save(s)
     except Exception as e:
         log(f"notify failed: {e}")
 
@@ -363,32 +620,87 @@ def load():
         s = json.load(open(STATE))
     except FileNotFoundError:
         s = {}
+    except (OSError, ValueError) as e:
+        bad = STATE + ".corrupt"
+        try:
+            os.replace(STATE, bad)
+        except OSError:
+            pass
+        log(f"state.json unreadable ({e!r}); moved to {bad} and starting fresh")
+        s = {}
     if "blocked" not in s:
         migrate_blocked(s)
     return s
 
 def migrate_blocked(s):
-    """Once, on the first run of 1.1+: 1.0 kept "never install this" only as HA's skip, which 1.1 ignores. Seed `blocked`
-    from what 1.0 left behind, and from HA's skipped_version (conservative: a human may have made that skip)."""
-    try:
-        skipped = ha(f"/states/{CORE_UPDATE}")["attributes"].get("skipped_version")
-    except Exception as e:
-        return log(f"blocked migration deferred: {e!r}")     # not written, so it is retried on the next run
-    found = [(s.get("open_issue") or {}).get("version"), s.get("bad_version"), skipped]
+    """Once, on the first run of 1.1+: seed `blocked` from the open problem and the recorded bad version.
+    Home Assistant's skipped_version is deliberately NOT used: we skip releases ourselves to hide the badge,
+    so seeding from it turns our own badge-hide into a permanent block (measured: 2026.10.4 on 2026-10-25)."""
+    found = [(s.get("open_issue") or {}).get("version"), s.get("bad_version")]
     s["blocked"] = list(dict.fromkeys(v for v in found if v))
     save(s)
     log(f"MIGRATED blocked={s['blocked']}")
-    if s["blocked"]:
-        notify("Smart updater upgraded to 1.1", f"Kept {', '.join(s['blocked'])} blocked (skipped or failed before). "
-               "Remove it from blocked in state.json to allow it.")
+
+def bump(s, key, n=1):
+    """One counter per day for the dashboard strip. Keeps 60 days."""
+    today = datetime.date.today()
+    daily = s.setdefault("daily", {})
+    e = daily.setdefault(today.isoformat(), {})
+    e[key] = int(e.get(key, 0)) + n
+    cutoff = (today - datetime.timedelta(days=60)).isoformat()
+    s["daily"] = {k: v for k, v in daily.items() if k >= cutoff}
+
+def build_strip(s, days=30):
+    """Oldest -> newest, only from the day the tool started. g quiet, u an update, r a rollback, freeze,
+    bad backup or a new integration failure (all problems)."""
+    daily = s.get("daily") or {}
+    today = datetime.date.today()
+    try:
+        first = datetime.date.fromisoformat(s.get("first_run") or "")
+    except ValueError:
+        first = today
+    start = max(today - datetime.timedelta(days=days - 1), first)
+    out, summ = [], {"quiet": 0, "updates": 0, "problems": 0}
+    for i in range((today - start).days, -1, -1):
+        e = daily.get((today - datetime.timedelta(days=i)).isoformat()) or {}
+        if e.get("rollbacks") or e.get("stalls") or e.get("backup_bad") or e.get("new_failures"):
+            out.append("r")
+            summ["problems"] += 1
+        elif e.get("updates"):
+            out.append("u")
+            summ["updates"] += 1
+        else:
+            out.append("g")
+            summ["quiet"] += 1
+    return out, summ
 
 def save(s):
-    tmp = STATE + ".tmp"
+    # notify() writes the dedupe log from a fresh read; a caller that loaded state before a notify would
+    # otherwise clobber it on its next save. Merge the on-disk log so those entries always survive.
+    try:
+        disk = json.load(open(STATE))
+        merged = dict(s.get("notify_log") or {})
+        for k, v in (disk.get("notify_log") or {}).items():
+            if k not in merged or (v or "") > (merged[k] or ""):
+                merged[k] = v
+        if merged:
+            s["notify_log"] = merged
+    except (OSError, ValueError):
+        pass
+    tmp = STATE + f".tmp.{os.getpid()}"
     json.dump(s, open(tmp, "w"), indent=1)
     os.replace(tmp, STATE)
 
 def version():
     return ha("/config")["version"]
+
+def dashboard_present():
+    """Is the documented status sensor installed? Without it a hold would be invisible."""
+    try:
+        ha("/states/sensor.smart_updater")
+        return True
+    except Exception:
+        return False
 
 def entries():
     return ha("/config/config_entries/entry")
@@ -427,20 +739,30 @@ def age_min(pre):
 def failed_install(s, why):
     """The release never took (request refused, or the Supervisor reverted a failed start): block it so we don't loop."""
     latest = ha(f"/states/{CORE_UPDATE}")["attributes"].get("latest_version")
+    if not latest:
+        return log(f"failed_install: no latest_version to block ({why})")
     s.pop("pre", None)
     s["open_issue"] = {"version": latest, "domains": [], "diagnosis": why, "at": datetime.datetime.now().isoformat()}
-    block(s, latest)
+    block(s, latest, "the update did not install")
     save(s)
     clear_badge()
-    notify(f"HA {latest} did not install", f"{why} It is blocked; the next release will be tried automatically.")
+    notify("install_failed", f"HA: {latest} did not install",
+           f"{why} It is blocked; the next release will be tried automatically.")
 
 def is_blocked(s, v):
     return v in s.get("blocked", []) or v in BLOCKED_VERSIONS
 
-def block(s, v):
+def block(s, v, reason=""):
     """Our own never-install list. HA's skipped_version can't be it: we skip releases just to hide the badge."""
-    if v and v not in s.setdefault("blocked", []):
+    if not v:
+        return
+    if v not in s.setdefault("blocked", []):
         s["blocked"].append(v)
+    if reason:
+        reasons = s.get("blocked_reasons")
+        if not isinstance(reasons, dict):
+            reasons = s["blocked_reasons"] = {}
+        reasons[v] = reason
 
 def clear_badge():
     try:
@@ -466,11 +788,13 @@ def rollback(target):
         except (urllib.error.URLError, OSError) as e:   # HTTPError is a URLError; timeouts are OSError
             log(f"rollback attempt {attempt} failed: {e!r}")
             time.sleep(60)
-    notify("HA rollback FAILED", f"Could not roll back to {target}. Do it by hand: ha core update --version {target}")
+    notify("rollback_failed", "HA: rollback FAILED",
+           f"Could not roll back to {target}. Do it by hand: ha core update --version {target}", urgent=True)
 
 def install(s, v_now, latest):
     s["pre"] = {"version": v_now, "failing": failing(entries()), "at": datetime.datetime.now().isoformat()}
     s.setdefault("last_good", v_now)
+    bump(s, "updates")
     save(s)
     log(f"installing core update from {v_now}")
     try:
@@ -484,33 +808,50 @@ def install(s, v_now, latest):
         if n >= 2:                            # once may be transient (job running, low disk); twice: skip it
             s.pop("refusals")
             failed_install(s, f"The Supervisor refused the update twice ({e!r}).")
+    write_status()
 
 def preflight():
     s = load()
     st = ha(f"/states/{CORE_UPDATE}")
     latest, v_now = st["attributes"].get("latest_version"), version()
+    s["last_version"] = v_now
     if not latest or latest == (st["attributes"].get("installed_version") or v_now):   # skipped still counts as pending
+        save(s)
+        write_status()
         return log("preflight: no core update pending")
     badge = st["state"] == "on"
     if is_blocked(s, latest):
         if badge:
             clear_badge()
+        save(s)
+        write_status()
         return log(f"preflight {latest}: blocked, not installing")
     expire_stale_pre(s, v_now)
+    if is_blocked(s, latest):                     # expire_stale_pre may have blocked it just now
+        if badge:
+            clear_badge()
+        save(s)
+        write_status()
+        return log(f"preflight {latest}: blocked after a failed install, not installing")
     if s.get("pre"):
         return log("preflight: install already in progress")
     cache = s.get("preflight", {})
     if cache.get("version") != latest or cache.get("date") != datetime.datetime.now().date().isoformat():
-        s["preflight"] = cache = assess(s, v_now, latest, cache)
+        cache = assess(s, v_now, latest, cache)                       # once a day; this call can take minutes
+        s = load()                                                    # do not clobber a concurrent sweep or heartbeat
+        s["preflight"] = cache
+        s["last_version"] = v_now
         save(s)
-    d = decide(cache["ai"], s.get("open_issue"), datetime.datetime.now().hour)
-    log(f"preflight {latest}: {cache['ai']} -> {d}")
-    if d == "hold" and not cache["notified"]:
-        cache["notified"] = True
-        save(s)
-        notify(f"HA {latest} held", f"Not installing yet - the AI found risk for this house:\n{cache['text'][:1200]}")
+    left = soak_remaining(cache)
+    d = decide(cache["ai"], datetime.datetime.now().hour, left)
+    log(f"preflight {latest}: risk={cache['ai']['risk']} soak={left:.0f}h -> {d}")
+    if d == "hold" and not dashboard_present():    # no dashboard to read: say it once per version
+        notify("held", f"HA: {latest} held",
+               f"Not installing it yet. {summarize(cache.get('text', ''))}", key=f"held:{latest}")
     if d in ("wait", "hold") and badge:
         clear_badge()                             # hides HA's badge only; preflight still installs it later
+    save(s)
+    write_status()
     if d == "install":
         install(s, v_now, latest)
 
@@ -518,16 +859,22 @@ def dryrun(latest):
     """preflight's AI assessment for any version, without installing or touching state."""
     s = load()
     c = assess(s, version(), latest, {})
-    d = "blocked" if is_blocked(s, latest) else decide(c["ai"], s.get("open_issue"), datetime.datetime.now().hour)
-    log(f"DRYRUN {latest}: {c['ai']} -> {d}\n{c['text']}")
+    left = soak_remaining(c)
+    d = "blocked" if is_blocked(s, latest) else decide(c["ai"], datetime.datetime.now().hour, left)
+    log(f"DRYRUN {latest}: {c['ai']} soak={left:.0f}h -> {d}\n{c['text']}")
 
 def assess(s, v_now, latest, cache):
+    published = None
     try:
-        body = http(f"https://api.github.com/repos/home-assistant/core/releases/tags/{latest}",
-                    headers={"User-Agent": "ha-smart-updater"}).get("body", "") or ""
+        rel = http(f"https://api.github.com/repos/home-assistant/core/releases/tags/{latest}",
+                   headers={"User-Agent": "ha-smart-updater"})
+        body = rel.get("body", "") or ""
+        published = rel.get("published_at")
         notes = body[:8000]
     except Exception:
         body, notes = "", "(release notes unavailable)"
+    if published is None and (cache or {}).get("version") == latest:
+        published = cache.get("published_at")
     domains = sorted({e["domain"] for e in entries() if e["state"] == "loaded"})
     closed = set()
     issues = gh_issues(f'repo:home-assistant/core is:issue "{latest}"', 15)
@@ -557,7 +904,7 @@ RISK: high or low   (high only if there is credible evidence {latest} breaks an 
 FIXED: yes, no or unknown   (does {latest} fix the open problem above? "unknown" if there is none)"""
     text = ai("smart_updater_preflight", prompt)
     cache = {"version": latest, "date": datetime.datetime.now().date().isoformat(), "ai": parse_ai(text, closed), "text": text,
-             "notified": cache.get("version") == latest and cache.get("notified", False)}   # one hold text per version
+             "published_at": published}
     return cache
 
 def check():
@@ -572,7 +919,8 @@ def check():
         if not s.get("rollback_failed_notified"):
             s["rollback_failed_notified"] = True
             save(s)
-            notify("HA still on broken version", f"Still on {v}. Roll back by hand: ha core update --version {target}")
+            notify("rollback_failed", "HA: still on the broken version",
+                   f"Still on {v}. Roll back by hand: ha core update --version {target}", urgent=True)
         return
     if bad and v != target:                       # a newer release replaced the broken one: forget it, check normally
         for k in ("bad_version", "rollback_retried", "rollback_failed_notified"):
@@ -583,13 +931,15 @@ def check():
         for k in ("bad_version", "pre", "rollback_retried", "rollback_failed_notified"):
             s.pop(k, None)
         save(s)
-        block(s, bad)
+        block(s, bad, "rolled back: it broke something here")
         save(s)
         st = ha(f"/states/{CORE_UPDATE}")
         if st["attributes"].get("latest_version") == bad and st["state"] == "on":
             clear_badge()
-        return notify(f"HA rolled back to {v}", f"{bad} broke something, so it was undone and blocked. "
-                      f"The next release will be tried automatically.\n\n{s.get('open_issue', {}).get('diagnosis', '')}")
+        write_status()
+        return notify("rollback", f"HA: rolled back to {v}",
+                      f"{bad} broke something, so it was undone and blocked. The next release will be tried.",
+                      key="rollback_done")
     expire_stale_pre(s, v)
     pre = s.get("pre")
     if not pre:
@@ -609,55 +959,325 @@ def check():
     if new:
         domains = sorted(set(new.values()))
         s["bad_version"] = v
-        block(s, v)
+        block(s, v, f"rolled back: it broke {', '.join(domains)}")
+        bump(s, "rollbacks")
         s["open_issue"] = {"version": v, "domains": domains, "diagnosis": "(diagnosing)", "at": datetime.datetime.now().isoformat()}
+        s["pending_diagnosis"] = {"version": v, "domains": domains, "at": datetime.datetime.now().isoformat(), "attempts": 0}
         save(s)                                   # persist before anything slow or restart-y
         log(f"check: {v} broke {domains}; rolling back to {pre['version']}")
-        s["open_issue"]["diagnosis"] = diagnose(domains)
-        s.setdefault("diagnosed", {}).update({k: "update" for k in new})
-        save(s)
-        notify(f"HA {v} broke {', '.join(domains)}", f"Rolling back to {pre['version']} now.\n\n{s['open_issue']['diagnosis']}")
+        notify("rollback", f"HA: {v} broke {', '.join(domains)}",
+               f"Rolling back to {pre['version']} now.", key="rollback_started", urgent=True)
         rollback(pre["version"])
+        try:                                      # best effort: the restart may cut this off; heartbeat retries it later
+            s = load()
+            s["open_issue"]["diagnosis"] = diagnose(domains)
+            s.pop("pending_diagnosis", None)
+            s.setdefault("diagnosed", {}).update({k: "update" for k in new})
+            save(s)
+        except Exception as e:
+            log(f"diagnosis deferred to heartbeat: {e!r}")
     else:
         s["last_good"] = v
         s.pop("pre", None)
-        if s.get("open_issue"):
-            s.pop("open_issue")
+        for k in ("open_issue", "pending_diagnosis"):
+            s.pop(k, None)
         save(s)
-        notify(f"HA updated to {v}", "All integrations healthy after the update.")
+    s["last_version"] = v
+    save(s)
+    write_status()
 
 def sweep():
     s = load()
-    expire_stale_pre(s, version())                # audit #1/#3: a stuck snapshot must not silence the sweep forever
-    now, ts = failing(entries()), datetime.datetime.now()
+    ent = entries()
+    v = version()
+    s["last_version"] = v
+    expire_stale_pre(s, v)                        # audit #1/#3: a stuck snapshot must not silence the sweep forever
+    now, ts = failing(ent), datetime.datetime.now()
+    failing_domains = sorted(set(now.values()))
+    if not s.get("first_run"):
+        try:
+            with open(LOG) as f:
+                s["first_run"] = f.readline()[:10] or datetime.date.today().isoformat()
+        except OSError:
+            s["first_run"] = datetime.date.today().isoformat()
+    s["last_failing"] = failing_domains
+    s["last_ignored"] = [d for d in failing_domains if d in IGNORE]
+    watched = []
+    for d in WATCH:
+        states = sorted({e["state"] for e in ent if e["domain"] == d and not e.get("disabled_by")})
+        watched.append({"domain": d, "state": ", ".join(states) if states else "not set up"})
+    s["last_watched"] = watched
+    jobs = []
+    for name, domains in JOBS.items():
+        domains = [d for d in domains if d not in IGNORE]      # known-broken domains are not this job's problem
+        if not domains:
+            jobs.append({"name": name, "state": "not set up", "broken": [], "missing": []})
+            continue
+        raw = {d: [e["state"] for e in ent if e["domain"] == d and not e.get("disabled_by")] for d in domains}
+        broken = [d for d, v in raw.items() if any(st in FAILING for st in v)]
+        missing = [d for d, v in raw.items() if not v]
+        if broken:
+            jobs.append({"name": name, "state": "not working", "broken": broken, "missing": missing})
+        elif len(missing) == len(domains):
+            jobs.append({"name": name, "state": "not set up", "broken": [], "missing": missing})
+        else:
+            jobs.append({"name": name, "state": "working", "broken": [], "missing": missing})
+    s["last_jobs"] = jobs
+    health = s.setdefault("health", {})
+    for d in {e["domain"] for e in ent if not e.get("disabled_by")}:
+        h = health.setdefault(d, {})
+        if d in failing_domains:
+            h.setdefault("down_since", ts.isoformat())
+            # keep ok_since: it is when the healthy streak began, and the 6 h rule needs it
+        elif h.get("down_since"):                 # recovered: a new healthy streak starts now
+            h["ok_since"] = ts.isoformat()
+            h.pop("down_since", None)
+            h.pop("notified", None)
+        else:                                     # still healthy: keep the streak start, do not reset it
+            h.setdefault("ok_since", ts.isoformat())
     if "first_seen" not in s:                     # first run: today's failures are the known baseline
         s["first_seen"] = {k: ts.isoformat() for k in now}
         s["diagnosed"] = {k: "baseline" for k in now}
         save(s)
-        return log(f"sweep: baseline {sorted(set(now.values()))}")
+        write_status()
+        return log(f"sweep: baseline {failing_domains}")
     seen, diagnosed = s["first_seen"], s.setdefault("diagnosed", {})
     for k in list(seen):
         if k not in now:
             seen.pop(k); diagnosed.pop(k, None)   # recovered: forget it so a relapse is diagnosed again
     for k in now:
         seen.setdefault(k, ts.isoformat())
-    due = {k: d for k, d in now.items() if k not in diagnosed
-           and (ts - datetime.datetime.fromisoformat(seen[k])).total_seconds() >= STUCK_MIN * 60}
-    if s.get("pre"):
-        due = {}                                  # mid-update: check() owns it
+    due = {}
+    for k, d in now.items():
+        h = health.get(d) or {}
+        down, ok = h.get("down_since"), h.get("ok_since")
+        if s.get("pre") or d in IGNORE or not down or h.get("notified") == down:
+            continue                              # mid-update check() owns it; known-broken; already told
+        if not ok or (parse_dt(down) - parse_dt(ok)).total_seconds() < 6 * 3600:
+            continue                              # no healthy history = baseline, stays quiet
+        if (ts - parse_dt(down)).total_seconds() < STUCK_MIN * 60:
+            continue
+        due[k] = d
     for k in due:
-        diagnosed[k] = ts.isoformat()
+        health[due[k]]["notified"] = health[due[k]]["down_since"]
+    if due:
+        bump(s, "new_failures")
     save(s)
     if due:
         domains = sorted(set(due.values()))
-        notify(f"HA: {', '.join(domains)} broken {STUCK_MIN}+ min", diagnose(domains))
-    log(f"sweep: failing={sorted(set(now.values()))} diagnosed_now={sorted(set(due.values()))}")
+        key = "integration_down:" + ";".join(f"{d}@{health[d].get('down_since', '')}" for d in domains)
+        notify("integration_down", f"HA: {', '.join(domains)} down", summarize(diagnose(domains)), key=key)
+    log(f"sweep: failing={failing_domains} quiet={s['last_ignored']} alerted={sorted(set(due.values()))}")
+    write_status()
+
+# ---------- dashboard status, heartbeat, backup health ----------
+def write_status():
+    """state.json + log tail -> <www_dir>/smart_updater_status.json for the dashboard. Never raises."""
+    try:
+        s = load()
+        cache = s.get("preflight") or {}
+        installed = s.get("last_version")
+        pending = None
+        prev = {}
+        try:
+            with open(os.path.join(WWW_DIR, "smart_updater_status.json")) as f:
+                prev = json.load(f)
+        except (OSError, ValueError):
+            pass
+        try:
+            st = ha(f"/states/{CORE_UPDATE}")          # skipped versions still count as pending here
+            latest = st["attributes"].get("latest_version")
+            installed = st["attributes"].get("installed_version") or installed
+            if latest and latest != installed:
+                pending = latest
+        except Exception:
+            pending = prev.get("pending")
+            installed = prev.get("installed") or installed
+        if cache.get("version") != pending:        # a brand-new release has no assessment yet
+            cache = {}
+        left = soak_remaining(cache)
+        blocked = list(s.get("blocked", []))
+        ai = cache.get("ai") or {"risk": None, "fixed": None}
+        if pending in blocked:
+            verdict = "blocked"
+        elif pending:
+            verdict = decide(ai, datetime.datetime.now().hour, left)
+        else:
+            verdict = "none"
+        if s.get("pre"):
+            state = "installing"
+        elif verdict == "blocked":
+            state = "blocked"
+        elif pending and left > 0:
+            state = "soaking"
+        elif pending and verdict == "hold":
+            state = "holding"
+        else:
+            state = "idle"
+        try:
+            recent = "".join(open(LOG).readlines()[-12:]).strip()
+        except OSError:
+            recent = ""
+        lines = recent.splitlines()
+        last_event = next((l for l in reversed(lines) if l[:2] == "20"), lines[-1] if lines else "")
+        stall = s.get("last_stall") or {}
+        backup = s.get("backup") or {}
+        oi = s.get("open_issue") or {}
+        try:
+            hb = float(open(os.path.join(DIR, ".heartbeat")).read().strip())
+            hb_at, hb_age = datetime.datetime.fromtimestamp(hb).isoformat(timespec="seconds"), int(time.time() - hb)
+        except (OSError, ValueError):
+            hb_at, hb_age = None, None
+        strip, strip_summary = build_strip(s)
+        out = {"state": state, "installed": installed, "pending": pending,
+               "diagnosis": oi.get("diagnosis"), "diagnosis_version": oi.get("version"),
+               "soak_hours": SOAK_HOURS, "soak_remaining_hours": round(left, 1),
+               "ai_risk": ai.get("risk"), "ai_fixed": ai.get("fixed"), "verdict": verdict,
+               "blocked": blocked, "bad_version": s.get("bad_version"),
+               "blocked_reasons": s.get("blocked_reasons") or {}, "blocked_config": list(BLOCKED_VERSIONS),
+               "first_run": s.get("first_run"), "strip_days": len(strip),
+               "window": list(WINDOW), "ignore": list(IGNORE),
+               "failing": s.get("last_failing") or [], "ignored_failing": s.get("last_ignored") or [],
+               "watched": s.get("last_watched") or [], "jobs": s.get("last_jobs") or [],
+               "last_event": last_event, "recent_log": recent,
+               "strip": strip, "strip_summary": strip_summary,
+               "heartbeat_at": hb_at, "heartbeat_age_seconds": hb_age,
+               "last_stall_seconds": stall.get("seconds"), "last_stall_at": stall.get("at"),
+               "backup_ok": backup.get("ok"), "backup_age_hours": backup.get("age_hours"),
+               "backup_at": backup.get("at"),
+               "updated": datetime.datetime.now().isoformat(timespec="seconds")}
+        os.makedirs(WWW_DIR, exist_ok=True)
+        tmp = os.path.join(WWW_DIR, ".smart_updater_status.tmp")
+        with open(tmp, "w") as f:
+            json.dump(out, f, indent=1)
+        os.replace(tmp, os.path.join(WWW_DIR, "smart_updater_status.json"))
+    except Exception as e:
+        if datetime.datetime.now().minute % 15 == 0:   # a broken ha_url must not write 1,440 lines a day
+            log(f"status write failed: {e!r}")
+
+def status():
+    write_status()
+
+def incident(last_beat, gap):
+    """Snapshot what Supervisor knows, before the old boot's logs rotate away."""
+    d = os.path.join("/config/claude/incidents", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(d, exist_ok=True)
+    meta = {"gap_seconds": round(gap), "last_beat": last_beat.isoformat(),
+            "recovered": datetime.datetime.now().isoformat()}
+    for name, path in (("host", "/host/info"), ("os", "/os/info"), ("core", "/core/info"),
+                       ("resolution", "/resolution/info"), ("supervisor", "/supervisor/info"),
+                       ("backups", "/backups/info")):
+        try:
+            meta[name] = sup(path)
+        except Exception as e:
+            meta[name] = {"error": repr(e)}
+    with open(os.path.join(d, "supervisor.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    for name in ("home-assistant.log", "home-assistant.log.1", "home-assistant.log.2"):
+        p = os.path.join("/config", name)
+        try:
+            if os.path.exists(p):
+                with open(p, "rb") as src, open(os.path.join(d, name), "wb") as dst:
+                    dst.write(src.read()[-2_000_000:])
+        except OSError:
+            pass
+    try:
+        root = "/config/claude/incidents"
+        dirs = sorted(x for x in os.listdir(root) if os.path.isdir(os.path.join(root, x)))
+        for old in dirs[:-10]:
+            shutil.rmtree(os.path.join(root, old), ignore_errors=True)
+    except OSError:
+        pass
+    log(f"incident saved to {d}")
+
+def heartbeat():
+    """Every minute: a gap over stall_min is a freeze; report it once, on recovery. Retries a deferred diagnosis."""
+    path = os.path.join(DIR, ".heartbeat")
+    now = time.time()
+    try:
+        last = float(open(path).read().strip())
+    except (OSError, ValueError):
+        last = 0.0
+    try:
+        s = load()
+        gap = now - last if last else 0
+        if last and gap > STALL_MIN * 60 and not s.get("pre"):
+            beat = datetime.datetime.fromtimestamp(last)
+            s["last_stall"] = {"seconds": round(gap), "at": datetime.datetime.now().isoformat(timespec="seconds")}
+            bump(s, "stalls")
+            save(s)
+            log(f"STALL detected: {gap:.0f}s since {beat.isoformat(timespec='seconds')}")
+            notify("stall_recovered", "HA: was unresponsive",
+                   f"Unresponsive for about {int(gap // 3600)}h {int((gap % 3600) // 60)}m, recovered at "
+                   f"{datetime.datetime.now():%H:%M}.", key=f"stall_recovered:{s['last_stall']['at']}")
+            try:
+                incident(beat, gap)
+            except Exception as e:
+                log(f"incident capture failed: {e!r}")
+        s = load()                                # notify() saved a fresh state; do not overwrite its dedupe record
+        pd = s.get("pending_diagnosis")
+        if pd and not s.get("pre") and int(pd.get("attempts", 0)) < 3:
+            pd["attempts"] = int(pd.get("attempts", 0)) + 1
+            s["pending_diagnosis"] = pd
+            save(s)
+            s["open_issue"] = s.get("open_issue") or {"version": pd.get("version"), "domains": pd.get("domains"),
+                                                      "at": pd.get("at")}
+            s["open_issue"]["diagnosis"] = diagnose(pd.get("domains") or [])
+            s.pop("pending_diagnosis", None)
+            save(s)
+    except Exception as e:
+        log(f"heartbeat failed: {e!r}")
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{now:.0f}\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"heartbeat write failed: {e!r}")
+    write_status()
+
+def backup_health():
+    """Daily: the newest Supervisor backup must be under 36 h old and contain the HA config."""
+    s = load()
+    try:
+        data = sup("/backups/info") or {}
+        backups = (data.get("data") or {}).get("backups") or []
+        backups = sorted(backups, key=lambda b: b.get("date") or "")
+        if not backups:
+            s["backup"] = {"at": None, "age_hours": None, "ok": False, "name": None, "type": None}
+            bump(s, "backup_bad")
+            save(s)
+            log("backup: no backups returned")
+            notify("backup_stale", "HA: backup needs attention", "There are no backups at all.", key="backup_stale")
+            write_status()
+            return
+        b = backups[-1]
+        when = parse_dt(b.get("date"))
+        now = datetime.datetime.now(when.tzinfo) if when.tzinfo else datetime.datetime.now()
+        age = (now - when).total_seconds() / 3600
+        has_ha = bool((b.get("content") or {}).get("homeassistant"))
+        ok = has_ha and age < 36
+        s["backup"] = {"at": b.get("date"), "age_hours": round(age, 1), "ok": ok,
+                       "name": b.get("name"), "type": b.get("type")}
+        if not ok:
+            bump(s, "backup_bad")
+        save(s)
+        log(f"backup: {b.get('name')!r} {b.get('date')} age={age:.1f}h homeassistant={has_ha} ok={ok}")
+        if not ok:
+            notify("backup_stale", "HA: backup needs attention",
+                   f"Newest backup is {age:.1f}h old and {'includes' if has_ha else 'does not include'} the HA config.",
+                   key="backup_stale")
+    except Exception as e:
+        log(f"backup_health failed: {e!r}")
+    write_status()
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "selftest":
-        selftest(); sys.exit()
-    if cmd != "selftest":
+        selftest()
+        log("selftest ok")                     # proof, when run through shell_command, that the deployed file works
+        sys.exit()
+    if cmd not in ("selftest", "heartbeat", "status"):     # those run every minute; do not flood the log
         for p in CONFIG_PROBLEMS:
             log(f"CONFIG ERROR: {p}")
     if cmd == "probe":
@@ -666,8 +1286,9 @@ if __name__ == "__main__":
             try: log(f"probe {name}: ok {f()}")
             except Exception as e: log(f"probe {name}: FAIL {e!r}")
         sys.exit()
-    if cmd not in ("preflight", "check", "sweep", "diagnose", "dryrun"):
-        sys.exit(f"usage: {sys.argv[0]} preflight|check|sweep|diagnose <domain..>|dryrun <version>|selftest")
+    if cmd not in ("preflight", "check", "sweep", "diagnose", "dryrun", "status", "heartbeat", "backup_health"):
+        sys.exit(f"usage: {sys.argv[0]} preflight|check|sweep|diagnose <domain..>|dryrun <version>"
+                 f"|status|heartbeat|backup_health|selftest")
     fg = "--fg" in sys.argv
     if not fg:                                    # detach: shell_command times out at 60s and waits for pipe EOF
         if os.fork():
@@ -683,10 +1304,27 @@ if __name__ == "__main__":
             if fg:
                 print(out)
         elif cmd == "dryrun":
-            dryrun(sys.argv[2])
+            dryrun([a for a in sys.argv[2:] if not a.startswith("--")][0])
         else:
             globals()[cmd]()
+        try:                                        # a success ends the streak
+            st = load()
+            if (st.get("errors") or {}).pop(cmd, None):
+                save(st)
+                log(f"{cmd}: recovered, error streak cleared")
+        except Exception:
+            pass
     except Exception as e:
         log(f"{cmd} failed: {e!r}")
-        if cmd != "sweep":
-            notify("HA smart updater error", f"{cmd} failed: {e!r}")
+        if cmd != "sweep":                            # a stuck sweep retries; a stuck command tells you after 3 in a row
+            try:
+                s = load()
+                errs = s.setdefault("errors", {})
+                n = int((errs.get(cmd) or {}).get("count", 0)) + 1
+                errs[cmd] = {"count": n, "at": datetime.datetime.now().isoformat()}
+                save(s)
+                if n >= 3:
+                    notify("updater_error", f"HA: smart updater {cmd} failing",
+                           f"{cmd} failed {n} times in a row; last error: {e!r}", key=f"error:{cmd}")
+            except Exception as e2:
+                log(f"error bookkeeping failed: {e2!r}")

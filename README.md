@@ -3,21 +3,29 @@
 Automatic Home Assistant Core updates that undo themselves when they break something. One Python script (standard
 library only) and one Home Assistant package. No custom integration, no add-on.
 
-**Status: new. Selftested (including simulated update/rollback flows) and dry-run on a live box; not yet exercised by a real Core release — the first real install/rollback will be the first end-to-end run.**
+**Status: v2. Selftested (including simulated update/rollback flows, soak and notification policy) and dry-run on a live box; not yet exercised by a real Core release — the first real install/rollback will be the first end-to-end run.**
 
 - **Before an update**, an AI reads the release notes and the GitHub issues that mention the new version, compares
-  them with the integrations you actually use, and decides: install tonight, or hold and tell you why.
+  them with the integrations you actually use, and decides: safe, or hold. A release also has to finish its **soak**
+  (7 days by default) before it may install, and it is reassessed every day through the soak — the AI keeps watching
+  the issues while the release ages.
 - **After every start**, the script compares your integrations with a snapshot taken just before the update. If an
   integration that worked before the update is now failing, and still failing ten minutes later, it **rolls Core back
   to the previous version and blocks the bad release.** That rule is fixed code; the AI has no vote on it.
 - **Then the AI diagnoses it**: it reads the failing integration's log lines, searches GitHub for the error, and
-  sends you a plain-English note: the cause, the known bug if there is one, the version that fixes it if known, and
-  what to do (usually nothing).
-- **When a newer release comes out**, the preflight checks whether it fixes the problem you rolled back from. If a
-  closed GitHub issue says so, it installs right away; if not, it waits for the nightly window. If it breaks again,
-  it rolls back again.
-- **Every 30 minutes**, any integration that has been failing for 30 minutes or more, for any reason, gets the same
-  diagnosis once.
+  writes the cause and the one thing to do. That goes to the dashboard; the push just says what happened.
+- **When a newer release comes out**, the preflight checks whether it fixes the problem you rolled back from and
+  says so on the dashboard — but it does not jump the queue: every release gets the same soak, risk check and
+  midnight window. If it breaks again, it rolls back again.
+- **It stays quiet.** Only things a person must act on are pushed: a rollback, a failed rollback, a newly broken
+  integration that had been healthy, a stale backup, or a freeze and recovery. Holds, successful updates and
+  known-broken integrations go to the dashboard only — and without the dashboard sensor installed, a hold is
+  pushed once per version instead. Messages are plain text — no Markdown, no AI scratchpad.
+- **Every minute**, a heartbeat records liveness in `.heartbeat`. A gap longer than `stall_min` (15 minutes) is
+  reported once, on recovery, and a snapshot of what Supervisor knows is saved to `/config/claude/incidents/`.
+- **Every 30 minutes**, an integration that breaks after being healthy for 6 hours or more gets one plain-text alert.
+  Integrations that were already broken at install time are the baseline and never alert; `ignore` silences any
+  domain you never want to hear about.
 
 ## Why this exists
 
@@ -92,9 +100,15 @@ not diagnosed until they recover and break again.
 | `notify` | none | the notify action to send to, `notify.mobile_app_my_phone` (or `notify/mobile_app_my_phone`) |
 | `ai_entity` | `ai_task.openai_ai_task` | the AI Task entity used for the preflight and diagnoses |
 | `core_update` | `update.home_assistant_core_update` | the Core update entity. If you change it, change it in the package's trigger too. |
-| `window` | `[3, 5]` | install Core updates from 03:00 to before 05:00, Home Assistant's local time |
-| `stuck_min` | `30` | the sweep diagnoses an integration once it has failed this many minutes |
+| `window` | `[3, 5]` | install Core updates from 03:00 to before 05:00, Home Assistant's local time. Two ascending hours. |
+| `soak_hours` | `168` | wait this long after a release is published before installing it. `0` disables the soak. |
+| `stuck_min` | `30` | an integration failing this long is eligible to alert (it also must have been healthy first) |
+| `stall_min` | `15` | a heartbeat gap this long is a freeze and is reported on recovery |
+| `ignore` | `[]` | domains that must never alert, for example `["wyoming", "influxdb"]` |
+| `watch` | `[]` | domains always shown on the dashboard with their state, healthy or not, for example `["lutron_caseta", "hue"]` |
+| `jobs` | `{}` | the house's jobs, each a name and the integrations behind it: `{"Lights": ["lutron_caseta", "hue"], "Laundry": ["smartthinq_sensors"]}`. A job is "working" only if all of its integrations are. Takes precedence over `watch` on the dashboard. |
 | `ha_url` | `http://localhost:8123` | Home Assistant's own API as seen from inside the Core container. Change it only for HTTPS (see Limits). |
+| `www_dir` | `/config/www` | where `smart_updater_status.json` is written for the dashboard (read by the Core container). |
 | `blocked_versions` | `[]` | versions never to install, for example `["2026.10.3"]`. This is how you block a release by hand. |
 
 `notify` has no safe default. Without it, every run writes `CONFIG ERROR: config.json has no "notify" target` to
@@ -114,15 +128,17 @@ recognise.
 | situation | what happens |
 |---|---|
 | A Core release newer than the installed one exists (checked when it appears, then hourly), whether or not it is skipped in Home Assistant | The AI assesses it once per version per day: `RISK: high` or `low`, and, if you have an open problem, `FIXED: yes`, `no` or `unknown`. |
-| The release fixes the problem you rolled back from | Install now. `FIXED: yes` counts only if the AI cites a GitHub issue the script itself found, closed after your problem started. |
+| The release is still inside its `soak_hours` | Wait, and keep the badge hidden. The AI reassesses it daily through the soak. |
+| The release fixes the problem you rolled back from | Treated like any other release: soak, then risk, then the window. `FIXED: yes` is informational (shown on the dashboard) and counts only if the AI cites a GitHub issue the script itself found, closed after your problem started. |
 | The release is blocked (by a failed install, a rollback, or `blocked_versions`) | Never installed. A newer release is assessed normally. |
-| `RISK: high` | Hold, hide the badge, and tell you why (once per version). Reassessed daily. |
+| `RISK: high` | Hold and hide the badge. The reason is on the dashboard; nothing is pushed. Reassessed daily. |
 | Anything else, AI failure included | Install inside the window; outside it, hide the badge and wait. The health check is the safety net either way. |
-| The install is refused twice, or Core comes back on the old version | Block the release and tell you. It is not retried. |
-| After a start, an integration fails that did not fail before the update | Wait ten minutes and look again. Still failing: block the release, diagnose, tell you, and roll back to the version from before the update. |
+| The install is refused twice, or Core comes back on the old version | Block the release and tell you once. It is not retried. |
+| After a start, an integration fails that did not fail before the update | Wait ten minutes and look again. Still failing: block the release, push "rolling back", roll back to the version from before the update, and diagnose afterwards (the heartbeat retries the diagnosis if the restart interrupts it). |
 | The rollback fails | Retry once; then tell you the exact command to run (`ha core update --version <old>`). |
-| After a start, everything that worked still works | Record the version as good and tell you. |
-| Any integration stays failing `stuck_min` minutes, update or not | Diagnose it once and tell you. A recovery resets it, so a relapse is diagnosed again. |
+| After a start, everything that worked still works | Record the version as good. Dashboard only; no push. |
+| An integration breaks after being healthy for 6 hours or more | One alert, once per down-streak, unless the domain is in `ignore`. A recovery resets it, so a relapse can alert again. |
+| Anything was already failing when the updater first ran | That is the baseline. It is shown on the dashboard and never pushed. |
 
 **Badges and skipping.** Home Assistant shows a badge for every pending update. The updater hides it by skipping the
 release in Home Assistant whenever it decides to wait or hold, and installs that release later anyway: install goes
@@ -143,16 +159,67 @@ pure logic plus the update flows against a fake Home Assistant.
 
 ## What you get told
 
-- `HA <version> held`: the AI found credible risk for an integration you use. The reason follows.
-- `HA updated to <version>`: installed, and every integration that worked still works.
-- `HA <version> broke <integrations>`: rolling back now, with the diagnosis.
-- `HA rolled back to <version>`: the rollback finished and the bad release is blocked.
-- `HA <version> did not install`: refused, or the Supervisor reverted a failed start. Blocked.
-- `HA rollback FAILED` / `HA still on broken version`: you need to act; the message has the command.
-- `HA: <integrations> broken 30+ min`: the diagnosis of something that broke on its own.
-- `HA smart updater error`: the script itself failed; the error follows.
+Only things that need a person, in plain text, at most once per 24 hours for the same key:
 
-Everything is also written to `/config/smart_updater/log.txt`. State lives in `state.json` beside it.
+- `HA: <version> broke <integrations>` — rolling back now.
+- `HA: rolled back to <version>` — the rollback finished and the bad release is blocked.
+- `HA: rollback FAILED` / `HA: still on the broken version` — you need to act; the message has the command.
+- `HA: <version> did not install` — refused, or the Supervisor reverted a failed start. Blocked.
+- `HA: <integration> down` — a new failure after 6 or more healthy hours; cause and action in two lines.
+- `HA: was unresponsive` — a freeze longer than `stall_min`, reported on recovery with the duration.
+- `HA: backup needs attention` — the newest backup is over 36 hours old or does not contain the HA config.
+- `HA: smart updater <command> failing` — the script itself failed three times in a row.
+
+Everything else — holds, soak countdowns, successful updates, the known-broken baseline — is dashboard-only and in
+`/config/smart_updater/log.txt`. State lives in `state.json` beside it.
+
+## Dashboard
+
+`status`, `heartbeat` and `backup_health` write `/config/www/smart_updater_status.json`. The dashboard is optional. A
+ready-made Lovelace dashboard is in [dashboard/system_dashboard.yaml](dashboard/system_dashboard.yaml); it needs one
+`command_line` sensor:
+
+```yaml
+command_line:
+  - sensor:
+      name: Smart Updater
+      unique_id: smart_updater_status
+      command: cat /config/www/smart_updater_status.json
+      value_template: "{{ value_json.state }}"
+      json_attributes:
+        - installed
+        - pending
+        - soak_hours
+        - soak_remaining_hours
+        - ai_risk
+        - ai_fixed
+        - verdict
+        - blocked
+        - window
+        - failing
+        - ignored_failing
+        - watched
+        - jobs
+        - strip
+        - strip_summary
+        - last_event
+        - diagnosis
+        - diagnosis_version
+        - recent_log
+        - last_stall_seconds
+        - last_stall_at
+        - backup_ok
+        - backup_age_hours
+        - backup_at
+        - updated
+      scan_interval: 60
+```
+
+If the sensor is not installed, holds are pushed once per version so nothing goes silent.
+
+The `state` is `idle`, `soaking`, `holding`, `blocked` or `installing`. The dashboard also reads `jobs` (the
+house's jobs, with `state` and the `broken` domains), `strip` (30 days, oldest first, `g` quiet / `a` update /
+`r` rollback, freeze or bad backup) and `strip_summary`.
 
 ## Limits
 
@@ -162,9 +229,9 @@ Everything is also written to `/config/smart_updater/log.txt`. State lives in `s
   is invisible to the health check.
 - **The rollback is a version pin without a new backup.** The install itself asks the Supervisor for a backup first;
   that backup is your fallback if a rollback ever leaves things worse.
-- **A planted GitHub issue can rush an install.** Someone could open an issue claiming a release fixes your problem
-  and close it themselves; the AI could then say `FIXED: yes` and the release installs outside the window. The health
-  check still runs after it, so the worst case is one more rollback.
+- **A planted GitHub issue cannot rush an install.** `FIXED: yes` is informational: it no longer skips the soak,
+  the risk hold or the window. A planted issue can at most make the AI cautious, which can only cause a hold; the
+  health check still runs after any install.
 - A rollback that takes longer than 30 minutes can produce a false "rollback FAILED" message.
 - **HTTPS on port 8123.** If `configuration.yaml` sets `http: ssl_certificate`, plain `http://localhost:8123` stops
   answering. Set `ha_url` to an `https://` address whose name matches the certificate and that resolves from inside
@@ -172,7 +239,11 @@ Everything is also written to `/config/smart_updater/log.txt`. State lives in `s
   covers `localhost`. The script verifies certificates and has no option to skip that, so a self-signed certificate or
   a name mismatch makes every call to Home Assistant fail: nothing is checked, rolled back or notified, and `log.txt`
   shows certificate errors. `probe` shows it as `probe ha /config: FAIL ... CERTIFICATE_VERIFY_FAILED`.
-- GitHub's search API is used without a token (a handful of requests per run, well inside its limits).
+- GitHub's search API is used without a token: 10 searches a minute. A busy sweep can approach that; when the
+  limit is hit, the diagnosis falls back to the raw log lines and nothing else changes.
+- The status file is written to `www_dir` (`/config/www` by default), which Home Assistant serves without
+  authentication at `/local/smart_updater_status.json`. It contains versions, integration names and the last 12
+  log lines — no secrets. Change `www_dir` if you do not want it served.
 
 ## Uninstall
 

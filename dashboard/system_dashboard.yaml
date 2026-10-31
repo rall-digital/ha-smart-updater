@@ -1,0 +1,154 @@
+title: Subutai
+views:
+  - title: Overview
+    path: overview
+    icon: mdi:shield-home-outline
+    type: sections
+    max_columns: 2
+    sections:
+      - type: grid
+        cards:
+          - type: markdown
+            content: |
+              {% set s = 'sensor.smart_updater' %}
+              {% set st = states(s) %}
+              {% set pending = state_attr(s, 'pending') %}
+              {% set installed = state_attr(s, 'installed') or 'unknown' %}
+              {% set blocked = state_attr(s, 'blocked') or [] %}
+              {% set bad = state_attr(s, 'bad_version') %}
+              {% set soak = state_attr(s, 'soak_remaining_hours') %}
+              {% set win = state_attr(s, 'window') or [0, 2] %}
+              {% set age = state_attr(s, 'backup_age_hours') %}
+              {% set ok = state_attr(s, 'backup_ok') %}
+              {% set upd = state_attr(s, 'updated') %}
+              {% set jobs = state_attr(s, 'jobs') or [] %}
+              {% set diag = state_attr(s, 'diagnosis') %}
+              {% set ns = namespace(bad=[], broken=[], stale=false, hb_dead=false) %}
+              {% for j in jobs %}{% if j.state == 'not working' %}{% set ns.bad = ns.bad + [j.name] %}{% for d in j.broken %}{% set ns.broken = ns.broken + [d] %}{% endfor %}{% endif %}{% endfor %}
+              {% if upd and as_timestamp(upd) %}{% set ns.stale = (now().timestamp() - as_timestamp(upd)) > 5400 %}{% endif %}
+              {% set hb_age = state_attr(s, 'heartbeat_age_seconds') %}
+              {% if hb_age is not none and hb_age > 300 %}{% set ns.hb_dead = true %}{% endif %}
+
+              {% if ns.stale %}
+              # Subutai hasn't checked in.
+
+              Its last report was at {{ upd[11:16] }}. Something may be wrong with Subutai itself.
+              {% elif ns.hb_dead %}
+              # Subutai's heartbeat has stopped.
+
+              Its regular checks still run, but it would no longer notice if the house froze.
+              {% elif st == 'installing' %}
+              # Subutai is updating now.
+
+              It is putting in a newer version of Home Assistant. Ten minutes after the restart it will check that everything still works, and it will put the old version back if anything broke.
+              {% elif ns.bad %}
+              # Something needs attention.
+
+              {{ ns.bad | join(' and ') }} {{ 'are' if ns.bad | length > 1 else 'is' }} not working.
+              {% else %}
+              # Everything is working.
+              {% endif %}
+
+              {% if not ns.stale and st != 'installing' %}
+              Your smart home is running version **{{ installed }}**.
+              {% if pending and pending in blocked %}
+              {% if bad and bad == pending %}
+              {{ pending }} broke something in this house, so Subutai put the working version back and blocked it. It will not install.
+              {% if diag %}What went wrong: {{ diag }}
+              {% endif %}
+              {% elif pending in (state_attr(s, 'blocked_config') or []) %}
+              {{ pending }} is set never to install in the configuration, so Subutai will not install it.
+              {% else %}
+              {% set reason = (state_attr(s, 'blocked_reasons') or {}).get(pending) %}
+              {{ pending }} is blocked{% if reason %} because {{ reason }}{% endif %}, so Subutai will not install it{% if state_attr(s, 'ai_risk') == 'high' %}. Its own check also found risk in it{% endif %}.
+              {% endif %}
+              {% elif st == 'soaking' %}
+              A newer version, {{ pending }}, is out. Subutai is waiting until it has been available for a week, so other people find the problems first. About {{ (soak / 24) | round(0) | int }} {{ 'day' if (soak / 24) | round(0) | int == 1 else 'days' }} to go.
+              {% elif st == 'holding' %}
+              A newer version, {{ pending }}, is out. Subutai found reports of problems with it, so it is waiting and will check again every day.
+              {% elif pending %}
+              A newer version, {{ pending }}, is out. It will install itself at the next window.
+              {% else %}
+              There is nothing newer to install.
+              {% endif %}
+              Updates only happen {% if win[0] == 0 and win[1] == 2 %}between midnight and 2 in the morning{% else %}between {{ '%02d:00' % win[0] }} and {{ '%02d:00' % win[1] }}{% endif %}, never during the day.
+              {% if pending and pending not in blocked and (state_attr(s, 'soak_hours') or 0) > 0 %}
+              {% set sh = state_attr(s, 'soak_hours') %}
+              {% set left = soak if soak is not none else sh %}
+              {% set filled = (((sh - left) / sh) * 8) | round(0) | int %}
+              {% if filled < 0 %}{% set filled = 0 %}{% endif %}
+              {% if filled > 8 %}{% set filled = 8 %}{% endif %}
+              Soak: {{ '█' * filled }}{{ '░' * (8 - filled) }} {{ ((sh - left) / 24) | round(0) | int }} of {{ (sh / 24) | round(0) | int }} days.
+              {% endif %}
+              {% endif %}
+
+              {% if not ns.stale %}
+              {% if age is not none %}
+              The last backup finished {{ age | round(0) | int }} hours ago and {% if ok %}contains everything needed to bring the house back{% else %}is missing the Home Assistant settings{% endif %}.
+              {% else %}
+              The backup has not been checked yet.
+              {% endif %}
+
+              {% set strip = state_attr(s, 'strip') or [] %}
+              {% set summ = state_attr(s, 'strip_summary') or {} %}
+              {% set fr = state_attr(s, 'first_run') %}
+              {% set sd = state_attr(s, 'strip_days') or (strip | length) %}
+              {% set months = ['January','February','March','April','May','June','July','August','September','October','November','December'] %}
+              {% if strip %}
+              {% if sd < 30 and fr %}Since I started on {{ fr[8:10] | int }} {{ months[(fr[5:7] | int) - 1] }}:{% else %}Last 30 days:{% endif %} {% for c in strip %}{% if c == 'r' %}🟥{% elif c == 'u' %}🟦{% else %}🟩{% endif %}{% endfor %}
+
+              {{ summ.get('quiet', 0) }} quiet, {{ summ.get('updates', 0) }} with an update, {{ summ.get('problems', 0) }} with a problem.
+              {% endif %}
+
+              {% set ev = state_attr(s, 'last_event') or '' %}{% set hh = ev[11:16] if ev | length > 16 else '' %}**Last thing Subutai did:** {% if 'sweep:' in ev %}{% if 'alerted=[]' in ev %}checked every system at {{ hh }}; no new problems.{% else %}checked every system at {{ hh }} and found a new problem.{% endif %}{% elif 'preflight' in ev %}{% if 'blocked' in ev %}checked for a new version at {{ hh }}; {{ pending }} is still blocked.{% elif 'no core update' in ev %}checked for a new version at {{ hh }}; nothing to install.{% else %}checked for a new version at {{ hh }}.{% endif %}{% elif 'backup:' in ev %}checked the backup at {{ hh }}.{% elif 'check:' in ev %}checked that the last update went well at {{ hh }}.{% elif 'STALL' in ev %}noticed the system had frozen and has recovered.{% elif 'NOTIFY' in ev %}texted you at {{ hh }}.{% else %}last activity at {{ hh }}.{% endif %}
+              {% endif %}
+
+      - type: grid
+        cards:
+          - type: markdown
+            content: |
+              {% set s = 'sensor.smart_updater' %}
+              {% set jobs = state_attr(s, 'jobs') or [] %}
+              {% set watched = state_attr(s, 'watched') or [] %}
+              {% set names = {'lutron_caseta': 'Lutron lights', 'hue': 'Hue lights', 'zha': 'Zigbee devices', 'intesisbox': 'Thermostats', 'mqtt': 'MQTT devices', 'smartthinq_sensors': 'LG washer and dryer'} %}
+              {% set ns = namespace(bad=[], broken=[]) %}
+              {% for j in jobs %}{% if j.state == 'not working' %}{% set ns.bad = ns.bad + [j.name] %}{% for d in j.broken %}{% set ns.broken = ns.broken + [d] %}{% endfor %}{% endif %}{% endfor %}
+
+              ## The house's jobs
+
+              Subutai checks every integration your house runs, every 30 minutes, and texts you once if one that was working stops.
+
+              {% if ns.bad %}
+              {% for j in jobs %}- **{{ j.name }}** — {{ j.state }}{% if j.broken %} ({{ j.broken | join(', ') }}){% elif j.missing %} ({{ j.missing | join(', ') }} not set up){% endif %}
+              {% endfor %}
+              {% elif jobs %}
+              All of the house's jobs are working: {{ jobs | map(attribute='name') | join(', ') }}.
+              {% elif watched %}
+              {% for w in watched %}- **{{ names.get(w.domain, w.domain) }}** — {% if w.state == 'loaded' %}working{% elif w.state == 'not set up' %}not set up{% else %}not working{% endif %}
+              {% endfor %}
+              {% else %}
+              No jobs are set up yet.
+              {% endif %}
+
+              {% set quiet = state_attr(s, 'ignored_failing') or [] %}
+              {% set quiet_names = {'influxdb': 'the database (influxdb)', 'tplink': 'the TP-Link plugs (tplink)', 'wyoming': 'voice control (wyoming)'} %}
+              {% if quiet %}
+              A few things are set to stay quiet, so it does not text you about them: {% for d in quiet %}{{ quiet_names.get(d, d) }}{% if not loop.last %}, {% endif %}{% endfor %}. They are old problems, not new ones.
+              {% endif %}
+
+          - type: markdown
+            content: |
+              {% set s = 'sensor.smart_updater' %}
+              {% set win = state_attr(s, 'window') or [0, 2] %}
+
+              ## Tonight
+
+              ```
+              {{ '%02d:00' % win[0] }}  update window starts
+              {{ '%02d:00' % win[1] }}  update window ends
+              02:30  restart, only if an update needs it
+              03:00  reboot, only if Supervisor asks
+              ~05:00  automatic backup
+              ```
+
+              The window is Subutai's. The rest are Home Assistant's own nightly chores.

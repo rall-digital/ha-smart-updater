@@ -47,3 +47,36 @@ automation:
         data:
           cmd: sweep
     mode: single
+
+  - id: smart_updater_heartbeat
+    alias: Smart Updater - Heartbeat
+    description: Every minute; records liveness to .heartbeat and reports a stall longer than stall_min (default 15 min) once, on recovery.
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+    actions:
+      - action: shell_command.smart_updater
+        data:
+          cmd: heartbeat
+    mode: single
+
+  - id: smart_updater_backup_health
+    alias: Smart Updater - Backup health
+    description: Daily at 09:00 and 5 min after start; checks the newest backup is under 36h old and contains the HA config.
+    triggers:
+      - trigger: time
+        at: "09:00:00"
+        id: daily
+      - trigger: homeassistant
+        event: start
+        id: start
+    actions:
+      - if:
+          - condition: trigger
+            id: start
+        then:
+          - delay: "00:05:00"
+      - action: shell_command.smart_updater
+        data:
+          cmd: backup_health
+    mode: single
