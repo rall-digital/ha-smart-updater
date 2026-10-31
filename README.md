@@ -283,7 +283,18 @@ house's jobs, with `state` and the `broken` domains), `strip` (30 days, oldest f
 
 With the official `tplink_omada` integration installed, Subutai can give a plain-English read of the whole TP-Link
 Omada network: every AP, switch, router and the controller, their CPU and memory, WAN and LAN link status, firmware
-and PoE. Once a day (07:00 by default) the `network` command sends that state to the AI and stores a short report:
+and PoE.
+
+It also asks the controller directly, through the same library the integration already ships, for the detail that
+never reaches Home Assistant as entities: how many things are connected and to which access point and network, each
+client's signal, the weakest links, guest and blocked counts, and each device's model and firmware. If that call
+fails for any reason the read falls back to the entities, so the report never goes missing.
+
+Note for anyone pointing their own tool at the controller: its API answers on **port 443**. The same calls on the
+web port 8043 come back as HTTP 500 for reasons the controller does not explain, which is a good way to lose an
+evening. Ports change nothing about what is stored.
+
+Once a day (07:00 by default) the `network` command sends that state to the AI and stores a short report:
 
 ```
 OVERALL: healthy

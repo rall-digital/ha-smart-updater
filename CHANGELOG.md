@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.0
+
+- **Deep network read.** The `network` command now asks the controller itself, through the library the Omada
+  integration already depends on, for what never reaches Home Assistant as entities: connected clients with their
+  access point, network and signal; per-AP and per-SSID counts; the weakest links; guest and blocked counts; and each
+  device's model and firmware. Read-only, and it falls back to the entity read if the call fails.
+- The report now names the hardware and the client picture, so "healthy" is a claim about the whole network rather
+  than about five sensors.
+- Gotcha recorded in the README: the controller's API answers on **port 443**; the same calls on 8043 return HTTP 500.
+
 ## 2.4.1
 
 - **Fix:** the status file carried the silent test's per-entity liveness (18 KB), pushing `sensor.smart_updater`'s

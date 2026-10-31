@@ -286,6 +286,7 @@ def selftest():
     assert summarize("X\nCAUSE: a\nKNOWN BUG: b\nDO: c") == "CAUSE: a DO: c"
     assert summarize("") == ""
     selftest_network()
+    selftest_deep()
     selftest_config()
     selftest_flows()
     selftest_v2()
@@ -320,6 +321,37 @@ def selftest_network():
     h2 = network_history([{"day": "2026-10-30", "d": {"North": [1.0, 2.0]}}], p, day="2026-10-30")
     assert len(h2) == 1 and h2[0]["d"]["North"] == [10.0, 85.0], h2               # same day replaces, never doubles
     assert len([h for h in network_history([], p)]) == 1
+
+def selftest_deep():
+    class C:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+    clients = [C(name="Phone", is_wireless=True, is_blocked=False, is_guest=False, ap_name="North",
+                 ssid="Home", signal_level=20, traffic_down=5 * 1024 * 1024),
+               C(name="TV", is_wireless=False, is_blocked=True, is_guest=False, ap_name=None,
+                 ssid=None, signal_level=None, traffic_down=0)]
+    devices = [C(name="North", model="EAP670", firmware_version="1.3.13")]
+    d = deep_summary(devices, clients)
+    assert d["clients"]["total"] == 2 and d["clients"]["wireless"] == 1 and d["clients"]["wired"] == 1, d
+    assert d["clients"]["blocked"] == 1 and d["clients"]["by_ap"] == {"North": 1}, d
+    assert d["clients"]["by_ssid"] == {"Home": 1} and d["clients"]["guest"] == 0
+    assert d["clients"]["weak"] == [{"name": "Phone", "signal": 20, "ap": "North"}], d["clients"]["weak"]
+    assert d["clients"]["weak_count"] == 1 and d["clients"]["top"][0]["name"] == "Phone"
+    assert d["devices"] == [{"name": "North", "model": "EAP670", "firmware": "1.3.13"}], d["devices"]
+    empty = deep_summary([], [])
+    assert empty["clients"]["total"] == 0 and empty["clients"]["by_ap"] == {} and empty["clients"]["weak"] == []
+    import tempfile
+    p = os.path.join(tempfile.mkdtemp(), "core.config_entries")
+    with open(p, "w") as f:
+        json.dump({"data": {"entries": [{"domain": "hue", "data": {}},
+                                        {"domain": "tplink_omada",
+                                         "data": {"host": "h", "username": "u", "password": "p", "verify_ssl": False}}]}}, f)
+    got = omada_creds(p)
+    assert got and got["host"] == "h" and got["username"] == "u", got          # values only; never logged
+    assert omada_creds(os.path.join(os.path.dirname(p), "nope")) is None
+    with open(p, "w") as f:
+        json.dump({"data": {"entries": [{"domain": "tplink_omada", "data": {"host": "h"}}]}}, f)
+    assert omada_creds(p) is None                                              # incomplete entry is not usable
 
 def selftest_config():
     import tempfile
@@ -1200,6 +1232,78 @@ def network_change(hist, step=5.0):
                 out.append(f"{name} {label} {a:.0f}% to {b:.0f}%")
     return out
 
+def omada_creds(path="/config/.storage/core.config_entries"):
+    """Host and login for the Omada integration, read from the same store the integration uses. Never logged."""
+    try:
+        with open(path) as f:
+            entries = json.load(f)["data"]["entries"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    for e in entries:
+        d = e.get("data") or {}
+        if e.get("domain") == "tplink_omada" and d.get("host") and d.get("username") and d.get("password"):
+            return d
+    return None
+
+def deep_summary(devices, clients):
+    """Aggregate the controller's live client list. Pure: takes objects with the library's attributes."""
+    by_ap, by_ssid, weak, talkers = {}, {}, [], []
+    wireless = wired = blocked = guest = 0
+    for c in clients:
+        if getattr(c, "is_wireless", False):
+            wireless += 1
+        else:
+            wired += 1
+        blocked += 1 if getattr(c, "is_blocked", False) else 0
+        guest += 1 if getattr(c, "is_guest", False) else 0
+        ap, ssid = getattr(c, "ap_name", None), getattr(c, "ssid", None)
+        if ap:
+            by_ap[ap] = by_ap.get(ap, 0) + 1
+        if ssid:
+            by_ssid[ssid] = by_ssid.get(ssid, 0) + 1
+        sig = getattr(c, "signal_level", None)
+        if isinstance(sig, (int, float)) and sig < 40:
+            weak.append({"name": getattr(c, "name", None) or getattr(c, "mac", "?"),
+                         "signal": int(sig), "ap": ap})
+        down = getattr(c, "traffic_down", 0) or 0
+        if down:
+            talkers.append({"name": getattr(c, "name", None) or getattr(c, "mac", "?"), "down": int(down)})
+    weak.sort(key=lambda w: w["signal"])
+    talkers.sort(key=lambda t: -t["down"])
+    devs = [{"name": getattr(d, "name", None), "model": getattr(d, "model", None),
+             "firmware": getattr(d, "firmware_version", None)} for d in devices]
+    return {"devices": devs, "clients": {"total": len(clients), "wireless": wireless, "wired": wired,
+            "blocked": blocked, "guest": guest, "by_ap": by_ap, "by_ssid": by_ssid,
+            "weak": weak[:3], "weak_count": len(weak), "top": talkers[:3]}}
+
+def omada_deep(timeout=60):
+    """Live client and device detail straight from the controller, via the library Home Assistant ships."""
+    cred = omada_creds()
+    if not cred:
+        return None
+    try:
+        import asyncio
+        from tplink_omada_client import OmadaClient
+    except Exception as e:
+        log(f"network: deep unavailable ({e!r})")
+        return None
+
+    async def pull():
+        cli = OmadaClient(cred["host"], cred["username"], cred["password"],
+                          verify_ssl=bool(cred.get("verify_ssl")))
+        await cli.login()
+        site = await cli.get_site_client((await cli.get_sites())[0])
+        devices = await site.get_devices()
+        clients = [c async for c in site.get_connected_clients()]
+        return devices, clients
+
+    try:
+        devices, clients = asyncio.run(asyncio.wait_for(pull(), timeout))
+    except Exception as e:
+        log(f"network: deep failed ({e!r})")
+        return None
+    return deep_summary(devices, clients)
+
 def network_read():
     """Summarise the Omada network for the AI and store a plain-English read. No control, read-only."""
     s = load()
@@ -1237,9 +1341,31 @@ def network_read():
         lines.append(f"- {d['name']}: " + "; ".join(bits))
     names = [c["name"] for c in parsed["clients"]]
     home = sum(1 for c in parsed["clients"] if c["state"] == "home")
+    deep = omada_deep()
+    deep_txt = ""
+    if deep:
+        cl = deep["clients"]
+        parts = [f"Connected clients: {cl['total']} ({cl['wireless']} wireless, {cl['wired']} wired)"]
+        if cl["by_ap"]:
+            parts.append("by access point " + ", ".join(f"{k} {v}" for k, v in sorted(cl["by_ap"].items())))
+        if cl["by_ssid"]:
+            parts.append("by network " + ", ".join(f"{k} {v}" for k, v in sorted(cl["by_ssid"].items())))
+        if cl["weak"]:
+            parts.append("weakest links " + ", ".join(f"{w['name']} {w['signal']}% on {w['ap']}" for w in cl["weak"]))
+        if cl["guest"] or cl["blocked"]:
+            parts.append(f"guests {cl['guest']}, blocked {cl['blocked']}")
+        if cl["top"]:
+            parts.append("most downloaded since connecting " +
+                         ", ".join(f"{t['name']} {t['down'] // (1024 * 1024)} MB" for t in cl["top"]))
+        deep_txt = ("\nController detail. " + "; ".join(parts) +
+                    "\nHardware: " + "; ".join(f"{d['name']} {d['model']} fw {d['firmware']}"
+                                               for d in deep["devices"] if d.get("name")))
+        if cl["weak_count"]:
+            warns.append(f"{cl['weak_count']} clients below 40% signal")
     summary = ("Devices:\n" + "\n".join(lines) +
                f"\n\nClients seen on the network: {len(names)}, {home} home" +
                (": " + ", ".join(names) if names else "") +
+               deep_txt +
                "\nWarnings: " + ("; ".join(warns) if warns else "none") +
                "\nSince the last check: " + ("; ".join(change) if change else "nothing notable"))
     prompt = f"""You are the network operator for a home. Below is the live state of its TP-Link Omada network
@@ -1250,15 +1376,18 @@ as reported by Home Assistant.
 Write a short plain-English read for the owner, exactly in this shape:
 OVERALL: healthy / degraded / down
 - up to five bullets covering: whether every device is connected; CPU and memory, naming anything at or above
-  80 %; any port that is off and what that likely means; firmware; PoE. Then the one thing worth doing, if any.
+  80 %; any port that is off and what that likely means; firmware; PoE; and, when the controller detail is present,
+  how many things are connected, whether any client is on a weak link, and whether anything is blocked or a guest.
+  Then the one thing worth doing, if any.
 Use only the numbers above. Mention a change only if the "since the last check" line lists one. No preamble,
 no markdown headings."""
     text = ai("smart_updater_network", prompt) or "The AI did not answer."
     s["network"] = {"at": now, "entities": len(eids), "devices": parsed["devices"],
                     "clients": {"tracked": len(names), "home": home, "names": names},
-                    "warnings": warns, "change": change, "history": hist, "report": text}
+                    "deep": deep or {}, "warnings": warns, "change": change, "history": hist, "report": text}
     save(s)
-    log(f"network: report devices={len(parsed['devices'])} clients={len(names)} warnings={len(warns)}")
+    log(f"network: report devices={len(parsed['devices'])} clients={len(names)} warnings={len(warns)} "
+        f"deep={'yes' if deep else 'no'}")
     write_status()
 
 def addons_health(s):
