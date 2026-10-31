@@ -27,6 +27,58 @@ library only) and one Home Assistant package. No custom integration, no add-on.
   Integrations that were already broken at install time are the baseline and never alert; `ignore` silences any
   domain you never want to hear about.
 
+## How it works, in plain English
+
+**The cast.** Home Assistant is the house computer. Subutai is a small script that lives inside it: a set of fixed
+rules plus a phone line to an AI. The AI is Home Assistant's own `ai_task` entity (default
+`ai_task.openai_ai_task`), a separate model that this project calls; it is not Home Assistant itself. GitHub is the
+town square where strangers report "this update broke my lights."
+
+**What happens all day.** Every minute, Subutai writes a heartbeat. Every 30 minutes it checks every integration and
+add-on, and runs the silent device test. Every hour it asks Home Assistant whether a newer Core version exists.
+
+**The update ritual, and where the AI fits.**
+
+1. **Is it new?** No newer version → nothing happens.
+2. **The waiting room.** A new release must be at least `soak_hours` old (seven days by default) before Subutai will
+   install it. No AI involved; a fixed rule. While it waits, the badge is hidden so nobody sees a pending update.
+3. **The consultant.** Once a day during that week Subutai calls the AI with four things: the release notes, the
+   recent GitHub complaints that mention this version, the names of the integrations in use (not devices, states or
+   household data), and, if a previous release broke something, what broke. It asks two questions:
+   - `RISK: high or low` — is there credible evidence this release breaks something we use?
+   - `FIXED: yes / no / unknown` — does it fix the problem we rolled back from?
+4. **The rules around the answer.** The AI answers in those two words, then at most five lines of explanation with
+   links. A `FIXED: yes` counts only if it cites a closed GitHub issue that the script itself found; an invented
+   citation is discarded. Closed issues never count as risk; only open issues about this version, for an integration
+   in use, do.
+5. **The decision.** Fixed code, not the AI: still soaking → wait; risk high → hold; otherwise install, but only
+   between `window[0]` and `window[1]` (00:00–02:00 by default).
+6. **The install.** It asks the Supervisor for exactly the version it assessed, with a backup first.
+7. **The morning after.** Ten minutes after the restart it compares the integrations with a snapshot taken just
+   before the update. Anything that worked before and is failing now gets a second look ten minutes later. Still
+   failing → **roll back and block**. That decision is fixed code; **the AI has no vote on it.**
+
+**What the AI is allowed to do.** Recommend caution (a hold) by saying "high risk"; and explain, in plain words, why
+something broke. Nothing else. It cannot install, roll back, block, run a command or change a setting. Its output is
+two words plus prose; the script parses the words and shows the prose.
+
+**When the AI is down or wrong.** *Down:* the release is treated as normal — it still soaks, still installs in the
+window, and the health check is the safety net. The AI failing never blocks an update or a rollback. *Wrong (says
+low risk, but it breaks):* the health check catches it and rolls back. That is why the AI is advice, not authority.
+*Wrong the other way (says high risk when it is fine):* Subutai holds and asks again the next day; nothing breaks.
+
+**When else the AI is used.** Only when something breaks. It reads the error lines for that integration, searches
+GitHub for the same error, and answers: `CAUSE / KNOWN BUG / FIXED IN / DO`. That explanation goes to the dashboard.
+It never decides the rollback.
+
+**What the AI is not used for.** The heartbeat, the silent device test, the backup check, add-on health, the soak,
+the window, the block list and the rollback. All fixed rules. The AI is a consultant for two yes/no questions and a
+translator of error messages — nothing more.
+
+**The silent test.** With `jobs` configured, Subutai watches whether the devices behind each job go quiet, writes
+down what it *would* have told you, and sends nothing, so the false-positive rate can be measured before device-level
+alerts are trusted. It uses no AI.
+
 ## Why this exists
 
 We ran hass-auto-update, our earlier public automation that installs every
