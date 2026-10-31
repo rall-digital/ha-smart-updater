@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0
+
+- **Two-stage preflight.** The first AI pass now names suspected breaking changes (`CONCERN: <token> | <why>`).
+  Subutai verifies each token against the house itself — `configuration.yaml`, `automations.yaml`, `scripts.yaml`,
+  `scenes.yaml`, `packages/`, `custom_templates/`, the entity registry and the installed integrations — and a second
+  AI pass judges with that evidence. A concern the house does not use is not risk. Only counts and file names are
+  sent to the AI; file contents stay on the box.
+- The dashboard shows what was checked against the house ("lutron_caseta — used here").
+- Tests for concern parsing and local verification (including a temp config tree).
+
 ## 2.1.0
 
 - **Add-on supervision.** Every add-on that was auto-updating is now driven only by the nightly window; the

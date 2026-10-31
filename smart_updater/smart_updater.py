@@ -135,6 +135,50 @@ def parse_ai(text, closed_urls=()):
         r["fixed"] = "unknown"
     return r
 
+def parse_concerns(text, top=5):
+    """CONCERN: <token> | <why> lines from the first AI pass."""
+    out = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*CONCERN\s*:\s*([^|—–]+?)\s*\|\s*(.*)$", line, re.I)
+        if not m:
+            continue
+        token = m.group(1).strip().strip("`'\"")
+        if not token or len(token) > 60:
+            continue
+        out.append({"token": token, "why": plain(m.group(2), 160)})
+    return out[:top]
+
+def config_paths(base="/config"):
+    paths = [os.path.join(base, f) for f in ("configuration.yaml", "automations.yaml", "scripts.yaml", "scenes.yaml")]
+    for sub, ext in (("packages", ".yaml"), ("custom_templates", ".jinja")):
+        try:
+            paths += [os.path.join(base, sub, f) for f in sorted(os.listdir(os.path.join(base, sub))) if f.endswith(ext)]
+        except OSError:
+            pass
+    return [p for p in paths if os.path.exists(p)]
+
+def verify_concerns(concerns, domains=(), base="/config"):
+    """Does this house use the thing each concern names? Counts only; file contents never leave the box."""
+    paths = config_paths(base)
+    by_plat = entities_by_platform() if base == "/config" else {}
+    out = []
+    for c in concerns:
+        tok = c["token"]
+        files = {}
+        for p in paths:
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    n = f.read().count(tok)
+            except OSError:
+                continue
+            if n:
+                files[os.path.basename(p)] = n
+        ents_hit = len(by_plat.get(tok, []))          # entities provided by that integration
+        configured = tok in set(domains)
+        out.append({**c, "files": files, "entities": ents_hit, "configured": configured,
+                    "used": bool(files) or ents_hit > 0 or configured})
+    return out
+
 def fix_lines(notes, domains, top=10):
     """Release-note lines that mention one of the domains (or its first word, or its pip-style name)."""
     keys = {k for d in domains for k in (d.lower(), d.lower().replace("_", "-"), d.split("_")[0].lower()) if len(k) >= 3}
@@ -224,6 +268,19 @@ def selftest():
     assert soak_remaining({"published_at": "garbage"}) == float(SOAK_HOURS)
     assert decide({"risk": "low", "fixed": None}, 4, soak_left=10) == "wait"
     assert decide({"risk": "low", "fixed": None}, 4, soak_left=0) == "install"
+    # v2.2: concerns are parsed, then verified against this house's own config
+    cs = parse_concerns("RISK: high\nCONCERN: lutron_caseta | TLS change\nCONCERN: `template` | new option\nnot a concern")
+    assert cs == [{"token": "lutron_caseta", "why": "TLS change"}, {"token": "template", "why": "new option"}], cs
+    import tempfile
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "packages"))
+    open(os.path.join(d, "configuration.yaml"), "w").write("lutron_caseta:\n  host: x\n")
+    open(os.path.join(d, "automations.yaml"), "w").write("- alias: a\n  service: light.turn_on\n")
+    open(os.path.join(d, "packages", "p.yaml"), "w").write("# lutron_caseta again\n")
+    v = verify_concerns([{"token": "lutron_caseta", "why": "x"}, {"token": "no_such_thing", "why": "y"}], ("hue",), d)
+    assert v[0]["files"] == {"configuration.yaml": 1, "p.yaml": 1} and v[0]["used"] and not v[0]["configured"], v
+    assert v[1]["used"] is False and v[1]["files"] == {}, v
+    assert verify_concerns([{"token": "hue", "why": ""}], ("hue",), d)[0]["used"] is True
     assert plain("**CAUSE:** boom\n[issue #1](https://x/1)") == "CAUSE: boom issue #1 (https://x/1)"
     assert plain("a\n\nb") == "a b" and len(plain("x" * 900)) == 400
     assert summarize("X\nCAUSE: a\nKNOWN BUG: b\nDO: c") == "CAUSE: a DO: c"
@@ -861,7 +918,9 @@ def dryrun(latest):
     c = assess(s, version(), latest, {})
     left = soak_remaining(c)
     d = "blocked" if is_blocked(s, latest) else decide(c["ai"], datetime.datetime.now().hour, left)
-    log(f"DRYRUN {latest}: {c['ai']} soak={left:.0f}h -> {d}\n{c['text']}")
+    if c.get("concerns"):
+        log("DRYRUN concerns: " + json.dumps(c["concerns"])[:900])
+    log(f"DRYRUN {latest}: {c['ai']} soak={left:.0f}h -> {d}\n{c.get('verify_text', '')}\n{c['text']}")
 
 def assess(s, v_now, latest, cache):
     published = None
@@ -901,10 +960,39 @@ Rules:
 
 Reply with exactly these first two lines, then up to 5 short lines of explanation citing issue URLs from above:
 RISK: high or low   (high only if there is credible evidence {latest} breaks an integration in use)
-FIXED: yes, no or unknown   (does {latest} fix the open problem above? "unknown" if there is none)"""
+FIXED: yes, no or unknown   (does {latest} fix the open problem above? "unknown" if there is none)
+Then up to 5 lines, one per suspected breaking change, naming something searchable in a config file or entity id:
+CONCERN: <integration domain, config key, entity id prefix, or YAML key> | <one line why>"""
     text = ai("smart_updater_preflight", prompt)
     cache = {"version": latest, "date": datetime.datetime.now().date().isoformat(), "ai": parse_ai(text, closed), "text": text,
              "published_at": published}
+    concerns = parse_concerns(text)
+    if concerns:
+        verified = verify_concerns(concerns, domains)
+        cache["concerns"] = verified
+        lines = []
+        for i, c in enumerate(verified, 1):
+            where = []
+            if c["configured"]:
+                where.append("integration configured")
+            if c["files"]:
+                where.append("config: " + ", ".join(f"{k} x{v}" for k, v in c["files"].items()))
+            if c["entities"]:
+                where.append(f"{c['entities']} entities")
+            lines.append(f"{i}. {c['token']} — {c['why']}\n   used here: {'; '.join(where) if where else 'not used'}")
+        verify_prompt = f"""A Home Assistant Core update {v_now} -> {latest} is pending. A first analysis listed suspected
+breaking changes. A local scan then checked whether THIS house uses each one.
+{chr(10).join(lines)}
+
+Rules: a concern this house does not use is not risk. A concern it does use is risk only if the release notes or the
+issues above show this release changes that thing. Answer with exactly:
+RISK: high or low
+Then one short line per concern saying whether it affects this house, with the reason."""
+        text2 = ai("smart_updater_verify", verify_prompt)
+        risk2 = parse_ai(text2)["risk"]
+        if risk2:
+            cache["ai"]["risk"] = risk2
+        cache["verify_text"] = text2
     return cache
 
 def check():
@@ -1225,6 +1313,7 @@ def write_status():
                "diagnosis": oi.get("diagnosis"), "diagnosis_version": oi.get("version"),
                "soak_hours": SOAK_HOURS, "soak_remaining_hours": round(left, 1),
                "ai_risk": ai.get("risk"), "ai_fixed": ai.get("fixed"), "verdict": verdict,
+               "concerns": cache.get("concerns") or [],
                "blocked": blocked, "bad_version": s.get("bad_version"),
                "blocked_reasons": s.get("blocked_reasons") or {}, "blocked_config": list(BLOCKED_VERSIONS),
                "first_run": s.get("first_run"), "strip_days": len(strip),

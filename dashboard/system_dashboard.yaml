@@ -22,6 +22,11 @@ views:
               {% set ok = state_attr(s, 'backup_ok') %}
               {% set upd = state_attr(s, 'updated') %}
               {% set jobs = state_attr(s, 'jobs') or [] %}
+              {% set cons = state_attr(s, 'concerns') or [] %}
+              {% if cons %}
+              **Checked against this house:** {% for c in cons %}{{ c.token }} — {{ 'used here' if c.used else 'not used here' }}{% if not loop.last %}; {% endif %}{% endfor %}
+              {% endif %}
+
               {% set diag = state_attr(s, 'diagnosis') %}
               {% set ns = namespace(bad=[], broken=[], stale=false, hb_dead=false) %}
               {% for j in jobs %}{% if j.state == 'not working' %}{% set ns.bad = ns.bad + [j.name] %}{% for d in j.broken %}{% set ns.broken = ns.broken + [d] %}{% endfor %}{% endif %}{% endfor %}

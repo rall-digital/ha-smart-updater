@@ -51,6 +51,11 @@ add-on, and runs the silent device test. Every hour it asks Home Assistant wheth
    links. A `FIXED: yes` counts only if it cites a closed GitHub issue that the script itself found; an invented
    citation is discarded. Closed issues never count as risk; only open issues about this version, for an integration
    in use, do.
+5. **The second stage: check it against this house.** The first pass also names suspected breaking changes
+   (`CONCERN: <integration, config key or entity prefix> | <why>`). Subutai then searches its own configuration files,
+   the entity registry and the installed integrations for each one, and a second AI pass judges only with that
+   evidence: a concern this house does not use is not risk. File contents never leave the house — the AI sees counts
+   and file names, not your configuration.
 5. **The decision.** Fixed code, not the AI: still soaking → wait; risk high → hold; otherwise install, but only
    between `window[0]` and `window[1]` (00:00–02:00 by default).
 6. **The install.** It asks the Supervisor for exactly the version it assessed, with a backup first.
@@ -180,6 +185,7 @@ recognise.
 | situation | what happens |
 |---|---|
 | A Core release newer than the installed one exists (checked when it appears, then hourly), whether or not it is skipped in Home Assistant | The AI assesses it once per version per day: `RISK: high` or `low`, and, if you have an open problem, `FIXED: yes`, `no` or `unknown`. |
+| The AI names a suspected breaking change | Subutai checks it against this house (config files, entities, installed integrations), then a second AI pass judges with that evidence. An unused concern is not risk. |
 | The release is still inside its `soak_hours` | Wait, and keep the badge hidden. The AI reassesses it daily through the soak. |
 | The release fixes the problem you rolled back from | Treated like any other release: soak, then risk, then the window. `FIXED: yes` is informational (shown on the dashboard) and counts only if the AI cites a GitHub issue the script itself found, closed after your problem started. |
 | The release is blocked (by a failed install, a rollback, or `blocked_versions`) | Never installed. A newer release is assessed normally. |
