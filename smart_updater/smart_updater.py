@@ -986,6 +986,95 @@ def check():
     save(s)
     write_status()
 
+def entities_by_platform():
+    """entity_id -> integration platform, from the registry the Core container can read."""
+    try:
+        reg = json.load(open("/config/.storage/core.entity_registry"))
+        ents = reg["data"]["entities"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    out = {}
+    for e in ents:
+        if e.get("disabled_by") or not e.get("platform"):
+            continue
+        out.setdefault(e["platform"], []).append(e["entity_id"])
+    return out
+
+def addons_health(s):
+    """Supervised add-ons: an add-on that errors, or stops after running, is reported once."""
+    try:
+        data = sup("/addons") or {}
+        addons = (data.get("data") or {}).get("addons") or []
+    except Exception as e:
+        log(f"addons: unavailable ({e!r})")
+        return
+    prev = s.get("addons_state") or {}
+    bad = []
+    for a in addons:
+        slug, st = a.get("slug"), a.get("state")
+        if not slug:
+            continue
+        if st == "error" or (prev.get(slug) == "started" and st == "stopped"):
+            bad.append((slug, st))
+        prev[slug] = st
+    s["addons_state"] = prev
+    s["addons_bad"] = [{"slug": x, "state": y} for x, y in bad]
+    if bad and not s.get("pre"):
+        for slug, why in bad:
+            notify("addon_down", f"HA: add-on {slug} is {why}",
+                   f"An add-on is not running: {slug} ({why}). Check its log.", key=f"addon_down:{slug}")
+    log(f"addons: bad={[':'.join(b) for b in bad]}")
+
+def shadow_health(s):
+    """The Truth Audit, in shadow: per-job device liveness. Writes would_speak to state; never notifies."""
+    by_plat = entities_by_platform()
+    try:
+        states = {x["entity_id"]: x for x in ha("/states")}
+    except Exception as e:
+        log(f"shadow: states unavailable ({e!r})")
+        return
+    now = datetime.datetime.now()
+    sh = s.setdefault("shadow", {})
+    ents = sh.setdefault("entities", {})
+    jobs = {}
+    for job, domains in JOBS.items():
+        total = down = 0
+        for d in domains:
+            if d in IGNORE:
+                continue
+            for eid in by_plat.get(d, []):
+                st = states.get(eid)
+                if not st:
+                    continue
+                total += 1
+                ok = st["state"] not in ("unavailable", "unknown")
+                rec = ents.setdefault(eid, {})
+                if ok:
+                    rec["ok_at"] = now.isoformat(timespec="seconds")
+                    rec.pop("down_since", None)
+                else:
+                    down += 1
+                    rec.setdefault("down_since", now.isoformat(timespec="seconds"))
+                rec["ok"] = ok
+        if total:
+            jobs[job] = {"total": total, "down": down}
+    would = []
+    for eid, rec in ents.items():
+        if rec.get("ok"):
+            continue
+        try:
+            since, last_ok = parse_dt(rec.get("down_since")), parse_dt(rec.get("ok_at"))
+        except (TypeError, ValueError):
+            continue
+        if (now - since).total_seconds() >= 3600 and (now - last_ok).total_seconds() >= 3600:
+            would.append({"entity": eid, "down_since": rec["down_since"], "last_ok": rec["ok_at"]})
+    sh["at"] = now.isoformat(timespec="seconds")
+    sh.setdefault("first_at", sh["at"])
+    sh["jobs"] = jobs
+    sh["would_speak"] = would[-50:]
+    sh["count"] = len(would)
+    log(f"shadow: jobs={jobs} would_speak={len(would)}")
+
 def sweep():
     s = load()
     ent = entries()
@@ -1023,6 +1112,9 @@ def sweep():
         else:
             jobs.append({"name": name, "state": "working", "broken": [], "missing": missing})
     s["last_jobs"] = jobs
+    addons_health(s)
+    if JOBS:
+        shadow_health(s)
     health = s.setdefault("health", {})
     for d in {e["domain"] for e in ent if not e.get("disabled_by")}:
         h = health.setdefault(d, {})
@@ -1139,6 +1231,7 @@ def write_status():
                "window": list(WINDOW), "ignore": list(IGNORE),
                "failing": s.get("last_failing") or [], "ignored_failing": s.get("last_ignored") or [],
                "watched": s.get("last_watched") or [], "jobs": s.get("last_jobs") or [],
+               "shadow": s.get("shadow") or {},
                "last_event": last_event, "recent_log": recent,
                "strip": strip, "strip_summary": strip_summary,
                "heartbeat_at": hb_at, "heartbeat_age_seconds": hb_age,

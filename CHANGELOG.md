@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.1.0
+
+- **Add-on supervision.** Every add-on that was auto-updating is now driven only by the nightly window; the
+  Supervisor's own `auto_update` toggle is off. A new sweep pass reports an add-on that errors, or that stops after
+  running, once per add-on (24 h dedupe). Failed add-on updates no longer pass unnoticed.
+- **The silent test.** With `jobs` configured, a per-job device check runs every 30 minutes: entities from the
+  registry, mapped to the integration that provides them. Regressions go to `state.json` as `shadow.would_speak`
+  and are never sent. The dashboard shows the count.
+- README: the update classes table and the one-door setup step.
+
 ## 2.0.0
 
 - **7-day soak.** `soak_hours` (default 168) holds every Core release for a week after it is published. The AI

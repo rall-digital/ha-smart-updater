@@ -130,6 +130,11 @@ views:
               No jobs are set up yet.
               {% endif %}
 
+              {% set sh = state_attr(s, 'shadow') or {} %}
+              {% if sh.get('first_at') %}
+              _Silent test since {{ sh.first_at[8:10] | int }} {{ ['January','February','March','April','May','June','July','August','September','October','November','December'][(sh.first_at[5:7] | int) - 1] }}: {{ sh.get('count', 0) }} thing{{ 's' if sh.get('count', 0) != 1 else '' }} it would have told you._
+              {% endif %}
+
               {% set quiet = state_attr(s, 'ignored_failing') or [] %}
               {% set quiet_names = {'influxdb': 'the database (influxdb)', 'tplink': 'the TP-Link plugs (tplink)', 'wyoming': 'voice control (wyoming)'} %}
               {% if quiet %}

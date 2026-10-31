@@ -221,6 +221,30 @@ The `state` is `idle`, `soaking`, `holding`, `blocked` or `installing`. The dash
 house's jobs, with `state` and the `broken` domains), `strip` (30 days, oldest first, `g` quiet / `a` update /
 `r` rollback, freeze or bad backup) and `strip_summary`.
 
+## What gets updated
+
+Subutai's policy is one door: every piece of software that can change the house enters through the same nightly
+window and the same decision point.
+
+| Class | What happens | Undo |
+|---|---|---|
+| Core | Subutai: soak, risk read, window, health check, automatic rollback | version pin |
+| Add-ons | The house's update automation installs them in the same 00:00–02:00 window, with the Supervisor's pre-update backup; Subutai reports an add-on that errors or stops | restore the backup (manual) |
+| HACS integrations | Same window; supervised | manual reinstall |
+| Cards / themes | Same window; cosmetic | irrelevant |
+| OS / Supervisor | Staged in the window; the host reboots at 03:00 only when the Supervisor asks | previous boot slot |
+| Device firmware | Manual | none |
+
+To make that true, turn off each add-on's own **auto update** toggle once (Settings > Add-ons > the add-on). That
+toggle is a Supervisor setting, separate from the update entities, and it is what lets an add-on update at 3 pm.
+
+## The silent test
+
+With `jobs` configured, every 30 minutes Subutai also checks the devices behind each job, using the entity registry
+to map entities to the integration that provides them. A device that was working and has been unavailable for an
+hour is recorded in `state.json` under `shadow.would_speak` — and **nothing is sent**. The dashboard shows the
+count. Run it for a month before trusting device-level alerts; the false-positive rate is the number that matters.
+
 ## Limits
 
 - **Core only.** Home Assistant OS, the Supervisor, add-ons and HACS integrations are not touched. Update them
