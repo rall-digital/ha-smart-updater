@@ -149,6 +149,19 @@ views:
           - type: markdown
             content: |
               {% set s = 'sensor.smart_updater' %}
+              {% set net = state_attr(s, 'network') or {} %}
+
+              ## Network
+
+              {% if net.report %}
+              {{ net.report }}
+              {% else %}
+              The TP-Link Omada integration is not set up yet. Add it in Settings > Devices & Services, then this fills in with a daily AI read.
+              {% endif %}
+
+          - type: markdown
+            content: |
+              {% set s = 'sensor.smart_updater' %}
               {% set win = state_attr(s, 'window') or [0, 2] %}
 
               ## Tonight

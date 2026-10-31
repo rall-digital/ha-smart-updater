@@ -1088,6 +1088,74 @@ def entities_by_platform():
         out.setdefault(e["platform"], []).append(e["entity_id"])
     return out
 
+def network():
+    network_read()
+
+def network_read():
+    """Summarise the Omada network for the AI and store a plain-English read. No control, read-only."""
+    s = load()
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    eids = entities_by_platform().get("tplink_omada", [])
+    if not eids:
+        s["network"] = {"at": now, "entities": 0,
+                        "report": "The TP-Link Omada integration is not set up yet."}
+        save(s)
+        write_status()
+        return log("network: no tplink_omada entities")
+    try:
+        states = {x["entity_id"]: x for x in ha("/states")}
+    except Exception as e:
+        return log(f"network: states unavailable ({e!r})")
+    status, cpu, mem, ports, fw, poe, poe_sw, clients = [], [], [], [], [], [], [], []
+    for eid in sorted(eids):
+        st = states.get(eid)
+        if not st:
+            continue
+        n = (st.get("attributes") or {}).get("friendly_name") or eid
+        v = st["state"]
+        if eid.startswith("device_tracker."):
+            clients.append(v)
+        elif eid.startswith("update."):
+            fw.append(f"{n} = {'update available' if v == 'on' else 'up to date'}")
+        elif "poe_power" in eid:
+            poe.append(f"{n} = {v} W")
+        elif eid.startswith("switch."):
+            poe_sw.append(f"{n} = {v}")
+        elif "cpu_usage" in eid:
+            cpu.append(f"{n} = {v} %")
+        elif "memory_usage" in eid:
+            mem.append(f"{n} = {v} %")
+        elif "device_status" in eid:
+            status.append(f"{n} = {v}")
+        elif eid.startswith("binary_sensor."):
+            ports.append(f"{n} = {v}")
+    home = sum(1 for c in clients if c == "home")
+    summary = (
+        "Devices:\n" + ("\n".join(status) or "(none)") +
+        "\nCPU:\n" + ("\n".join(cpu) or "(none)") +
+        "\nMemory:\n" + ("\n".join(mem) or "(none)") +
+        "\nLink and port sensors:\n" + ("\n".join(ports) or "(none)") +
+        "\nFirmware:\n" + ("\n".join(fw) or "(none)") +
+        "\nPoE power:\n" + ("\n".join(poe) or "(none)") +
+        "\nPoE switches:\n" + ("\n".join(poe_sw) or "(none)") +
+        f"\nTracked clients: {len(clients)} present, {home} home")
+    prompt = f"""You are the network operator for a home. Below is the live state of its TP-Link Omada network
+as reported by Home Assistant.
+
+{summary}
+
+Write a short plain-English read for the owner, exactly in this shape:
+OVERALL: healthy / degraded / down
+- up to five bullets covering: the devices and whether all are connected; CPU and memory (name anything at or
+  above 80 %); WAN and LAN link status (name any port that is off); firmware; PoE. Then the one thing worth doing,
+  if anything. Use the numbers above. Do not invent data. No preamble, no markdown headings."""
+    text = ai("smart_updater_network", prompt) or "The AI did not answer."
+    s["network"] = {"at": now, "entities": sum(len(x) for x in (status, cpu, mem, ports, fw, poe, poe_sw)) + len(clients),
+                    "report": text}
+    save(s)
+    log(f"network: report entities={len(rows)}")
+    write_status()
+
 def addons_health(s):
     """Supervised add-ons: an add-on that errors, or stops after running, is reported once."""
     try:
@@ -1320,7 +1388,7 @@ def write_status():
                "window": list(WINDOW), "ignore": list(IGNORE),
                "failing": s.get("last_failing") or [], "ignored_failing": s.get("last_ignored") or [],
                "watched": s.get("last_watched") or [], "jobs": s.get("last_jobs") or [],
-               "shadow": s.get("shadow") or {},
+               "shadow": s.get("shadow") or {}, "network": s.get("network") or {},
                "last_event": last_event, "recent_log": recent,
                "strip": strip, "strip_summary": strip_summary,
                "heartbeat_at": hb_at, "heartbeat_age_seconds": hb_age,
@@ -1468,9 +1536,9 @@ if __name__ == "__main__":
             try: log(f"probe {name}: ok {f()}")
             except Exception as e: log(f"probe {name}: FAIL {e!r}")
         sys.exit()
-    if cmd not in ("preflight", "check", "sweep", "diagnose", "dryrun", "status", "heartbeat", "backup_health"):
+    if cmd not in ("preflight", "check", "sweep", "diagnose", "dryrun", "status", "heartbeat", "backup_health", "network"):
         sys.exit(f"usage: {sys.argv[0]} preflight|check|sweep|diagnose <domain..>|dryrun <version>"
-                 f"|status|heartbeat|backup_health|selftest")
+                 f"|status|heartbeat|backup_health|network|selftest")
     fg = "--fg" in sys.argv
     if not fg:                                    # detach: shell_command times out at 60s and waits for pipe EOF
         if os.fork():

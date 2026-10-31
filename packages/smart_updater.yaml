@@ -80,3 +80,15 @@ automation:
         data:
           cmd: backup_health
     mode: single
+
+  - id: smart_updater_network
+    alias: Smart Updater - Network read
+    description: Daily at 07:00; asks the AI for a plain-English read of the TP-Link Omada network.
+    triggers:
+      - trigger: time
+        at: "07:00:00"
+    actions:
+      - action: shell_command.smart_updater
+        data:
+          cmd: network
+    mode: single

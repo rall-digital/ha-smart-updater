@@ -279,6 +279,26 @@ The `state` is `idle`, `soaking`, `holding`, `blocked` or `installing`. The dash
 house's jobs, with `state` and the `broken` domains), `strip` (30 days, oldest first, `g` quiet / `a` update /
 `r` rollback, freeze or bad backup) and `strip_summary`.
 
+## The network read
+
+With the official `tplink_omada` integration installed, Subutai can give a plain-English read of the whole TP-Link
+Omada network: every AP, switch, router and the controller, their CPU and memory, WAN and LAN link status, firmware
+and PoE. Once a day (07:00 by default) the `network` command sends that state to the AI and stores a short report:
+
+```
+OVERALL: healthy
+- All devices are connected.
+- CPU is low; memory is high on South (75%) and North (66%).
+- WAN is up; router port 4 LAN is off.
+- All firmware is up to date.
+- JetStream port 1 uses 5.3 W of PoE.
+Consider checking what is connected to router port 4.
+```
+
+It is **read-only**. Subutai never reconnects, blocks or reconfigures a client or a port. The report appears in the
+dashboard's Network card and in the `network` sensor attribute. The command can be run on demand:
+`shell_command.smart_updater` with `cmd: network`.
+
 ## What gets updated
 
 Subutai's policy is one door: every piece of software that can change the house enters through the same nightly

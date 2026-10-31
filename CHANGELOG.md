@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.0
+
+- **Network read.** A new `network` command summarises the TP-Link Omada network (devices, CPU/memory, WAN and LAN
+  links, firmware, PoE, tracked clients) and asks the AI for a short plain-English read. Read-only: no reconnect,
+  block or port control. Daily at 07:00; exposed as the `network` sensor attribute and a dashboard card.
+- Adds a `Network` job when `tplink_omada` is in `jobs`.
+
 ## 2.2.0
 
 - **Two-stage preflight.** The first AI pass now names suspected breaking changes (`CONCERN: <token> | <why>`).
