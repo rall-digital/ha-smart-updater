@@ -1482,6 +1482,9 @@ def write_status():
         except (OSError, ValueError):
             hb_at, hb_age = None, None
         strip, strip_summary = build_strip(s)
+        sh = s.get("shadow") or {}
+        # per-entity liveness is ~18 KB and the dashboard reads none of it; keep the counters and the per-job totals
+        shadow = {k: sh[k] for k in ("at", "first_at", "count", "jobs") if k in sh}
         out = {"state": state, "installed": installed, "pending": pending,
                "diagnosis": oi.get("diagnosis"), "diagnosis_version": oi.get("version"),
                "soak_hours": SOAK_HOURS, "soak_remaining_hours": round(left, 1),
@@ -1493,7 +1496,7 @@ def write_status():
                "window": list(WINDOW), "ignore": list(IGNORE),
                "failing": s.get("last_failing") or [], "ignored_failing": s.get("last_ignored") or [],
                "watched": s.get("last_watched") or [], "jobs": s.get("last_jobs") or [],
-               "shadow": s.get("shadow") or {}, "network": s.get("network") or {},
+               "shadow": shadow, "network": s.get("network") or {},
                "last_event": last_event, "recent_log": recent,
                "strip": strip, "strip_summary": strip_summary,
                "heartbeat_at": hb_at, "heartbeat_age_seconds": hb_age,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.1
+
+- **Fix:** the status file carried the silent test's per-entity liveness (18 KB), pushing `sensor.smart_updater`'s
+  attributes past Home Assistant's 16 KB limit — the recorder warned every minute and dropped them. The status now
+  keeps the silent-test counters and per-job totals; the full per-entity list stays in `state.json`. File size
+  28 KB → 7 KB.
+
 ## 2.4.0
 
 - **Deeper network read.** The `network` command now builds one record per device — status, CPU, memory, firmware,
